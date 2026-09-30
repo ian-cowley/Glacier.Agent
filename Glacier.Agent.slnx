@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/Glacier.Agent/Glacier.Agent.csproj" />
+  <Project Path="tests/Glacier.Agent.Tests/Glacier.Agent.Tests.csproj" />
+  <Project Path="benchmarks/Glacier.Agent.Benchmarks/Glacier.Agent.Benchmarks.csproj" />
+</Solution>
