@@ -1,3 +1,5 @@
+![Glacier.Agent Banner](assets/banner.jpg)
+
 # 🤖 Glacier.Agent (Pillar 14)
 ## *Pure C# .NET 10 Autonomous Agent Runtime, SIMD Trie Tokenizer, HNSW / IVF-PQ Vector Index, Native AOT CLI, and MCP Event Bus*
 
@@ -22,6 +24,10 @@
 ---
 
 ## 2. Architecture & Subsystems
+
+<p align="center">
+  <img src="assets/architecture.jpg" alt="Glacier.Agent Architecture Blueprint" width="100%" />
+</p>
 
 ```
                                 Glacier.Agent Pipeline
