@@ -47,3 +47,8 @@ scratch/
 appsettings*.json
 !appsettings.template.json
 *.env*
+
+bin/
+obj/
+*.tmp
+!.env.example
