@@ -4,13 +4,14 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
 /// <summary>
 /// Native pure C# Model Context Protocol (MCP) server.
-/// Streams JSON-RPC 2.0 messages for tools, resources, and prompt templates.
+/// Streams JSON-RPC 2.0 messages for tools, resources, and prompt templates with zero reflection (Native AOT ready).
 /// </summary>
 public sealed class McpServer : IAsyncDisposable, IDisposable
 {
@@ -19,7 +20,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
     private readonly string _version;
     private readonly CancellationTokenSource _cts = new();
     private Task? _listenerTask;
-    private bool _isInitialized = false;
+    private volatile bool _isInitialized;
 
     private readonly ConcurrentDictionary<string, (McpTool Tool, Func<string, CancellationToken, ValueTask<McpToolCallResult>> Handler)> _tools = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, (McpResource Resource, Func<string, CancellationToken, ValueTask<McpResourceContent>> Reader)> _resources = new(StringComparer.Ordinal);
@@ -29,7 +30,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
     public string Version => _version;
     public bool IsInitialized => _isInitialized;
 
-    public McpServer(IMcpTransport transport, string name = "glacier-agent-mcp", string version = "1.0.0")
+    public McpServer(IMcpTransport transport, string name = "glacier-agent-mcp", string version = "1.1.0")
     {
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         _name = name;
@@ -46,11 +47,12 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         object schemaObj;
         try
         {
-            schemaObj = JsonSerializer.Deserialize<JsonElement>(agentTool.ParameterJsonSchema);
+            using var doc = JsonDocument.Parse(agentTool.ParameterJsonSchema);
+            schemaObj = doc.RootElement.Clone();
         }
         catch
         {
-            schemaObj = new { type = "object" };
+            schemaObj = """{"type":"object"}""";
         }
 
         var mcpTool = new McpTool(agentTool.Name, agentTool.Description, schemaObj);
@@ -98,7 +100,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                     {
                         await ProcessMessageAsync(line, ct).ConfigureAwait(false);
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (ex is not OperationCanceledException)
                     {
                         Console.Error.WriteLine($"[McpServer] Error processing message: {ex.Message}");
                     }
@@ -116,13 +118,11 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         using var doc = JsonDocument.Parse(json);
         JsonElement root = doc.RootElement;
 
-        // Extract ID (may be number, string, or absent for notifications)
         JsonElement idElement = default;
         bool hasId = root.TryGetProperty("id", out idElement);
 
         if (!root.TryGetProperty("method", out JsonElement methodElem))
         {
-            // Response message received by server, ignore
             return;
         }
 
@@ -132,16 +132,14 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
 
         if (!hasId)
         {
-            // Notification
-            HandleNotification(method, paramsElem);
+            HandleNotification(method);
             return;
         }
 
-        // Request expecting a response
         try
         {
-            object result = await HandleRequestAsync(method, paramsElem, ct).ConfigureAwait(false);
-            await SendSuccessResponseAsync(idElement, result, ct).ConfigureAwait(false);
+            Action<Utf8JsonWriter> writeResult = await HandleRequestAsync(method, paramsElem, ct).ConfigureAwait(false);
+            await SendSuccessResponseAsync(idElement, writeResult, ct).ConfigureAwait(false);
         }
         catch (McpRpcException rpcEx)
         {
@@ -153,7 +151,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         }
     }
 
-    private void HandleNotification(string method, JsonElement parameters)
+    private void HandleNotification(string method)
     {
         if (method == "notifications/initialized")
         {
@@ -161,23 +159,30 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         }
     }
 
-    private async ValueTask<object> HandleRequestAsync(string method, JsonElement parameters, CancellationToken ct)
+    private async ValueTask<Action<Utf8JsonWriter>> HandleRequestAsync(string method, JsonElement parameters, CancellationToken ct)
     {
         switch (method)
         {
             case "initialize":
+            {
                 _isInitialized = true;
-                return new McpInitializeResult(
+                var initResult = new McpInitializeResult(
                     ProtocolVersion: "2024-11-05",
                     Capabilities: new McpServerCapabilities(
-                        Tools: new { },
-                        Resources: new { },
-                        Prompts: new { },
-                        Logging: new { }),
+                        Tools: new McpCapabilityFlag(),
+                        Resources: new McpCapabilityFlag(),
+                        Prompts: new McpCapabilityFlag(),
+                        Logging: new McpCapabilityFlag()),
                     ServerInfo: new McpImplementation(_name, _version));
+                return writer => JsonSerializer.Serialize(writer, initResult, AgentMcpJsonContext.Default.McpInitializeResult);
+            }
 
             case "ping":
-                return new { };
+                return static writer =>
+                {
+                    writer.WriteStartObject();
+                    writer.WriteEndObject();
+                };
 
             case "tools/list":
             {
@@ -186,12 +191,22 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 {
                     toolList.Add(tool);
                 }
-                return new { tools = toolList };
+                return writer =>
+                {
+                    writer.WriteStartObject();
+                    writer.WriteStartArray("tools");
+                    foreach (var t in toolList)
+                    {
+                        t.WriteTo(writer);
+                    }
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                };
             }
 
             case "tools/call":
             {
-                if (!parameters.TryGetProperty("name", out JsonElement nameElem))
+                if (parameters.ValueKind != JsonValueKind.Object || !parameters.TryGetProperty("name", out JsonElement nameElem))
                 {
                     throw new McpRpcException(-32602, "Missing 'name' in tools/call parameters.");
                 }
@@ -209,7 +224,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 }
 
                 McpToolCallResult callResult = await entry.Handler(argumentsJson, ct).ConfigureAwait(false);
-                return callResult;
+                return writer => JsonSerializer.Serialize(writer, callResult, AgentMcpJsonContext.Default.McpToolCallResult);
             }
 
             case "resources/list":
@@ -219,12 +234,18 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 {
                     resourceList.Add(res);
                 }
-                return new { resources = resourceList };
+                return writer =>
+                {
+                    writer.WriteStartObject();
+                    writer.WritePropertyName("resources");
+                    JsonSerializer.Serialize(writer, resourceList, AgentMcpJsonContext.Default.ListMcpResource);
+                    writer.WriteEndObject();
+                };
             }
 
             case "resources/read":
             {
-                if (!parameters.TryGetProperty("uri", out JsonElement uriElem))
+                if (parameters.ValueKind != JsonValueKind.Object || !parameters.TryGetProperty("uri", out JsonElement uriElem))
                 {
                     throw new McpRpcException(-32602, "Missing 'uri' in resources/read parameters.");
                 }
@@ -236,7 +257,14 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 }
 
                 McpResourceContent content = await entry.Reader(uri, ct).ConfigureAwait(false);
-                return new { contents = new[] { content } };
+                return writer =>
+                {
+                    writer.WriteStartObject();
+                    writer.WriteStartArray("contents");
+                    JsonSerializer.Serialize(writer, content, AgentMcpJsonContext.Default.McpResourceContent);
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                };
             }
 
             case "prompts/list":
@@ -246,12 +274,18 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 {
                     promptList.Add(prompt);
                 }
-                return new { prompts = promptList };
+                return writer =>
+                {
+                    writer.WriteStartObject();
+                    writer.WritePropertyName("prompts");
+                    JsonSerializer.Serialize(writer, promptList, AgentMcpJsonContext.Default.ListMcpPrompt);
+                    writer.WriteEndObject();
+                };
             }
 
             case "prompts/get":
             {
-                if (!parameters.TryGetProperty("name", out JsonElement nameElem))
+                if (parameters.ValueKind != JsonValueKind.Object || !parameters.TryGetProperty("name", out JsonElement nameElem))
                 {
                     throw new McpRpcException(-32602, "Missing 'name' in prompts/get parameters.");
                 }
@@ -272,7 +306,13 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 }
 
                 List<McpPromptMessage> messages = await entry.Handler(argsDict, ct).ConfigureAwait(false);
-                return new { messages };
+                return writer =>
+                {
+                    writer.WriteStartObject();
+                    writer.WritePropertyName("messages");
+                    JsonSerializer.Serialize(writer, messages, AgentMcpJsonContext.Default.ListMcpPromptMessage);
+                    writer.WriteEndObject();
+                };
             }
 
             default:
@@ -280,7 +320,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         }
     }
 
-    private async ValueTask SendSuccessResponseAsync(JsonElement id, object result, CancellationToken ct)
+    private async ValueTask SendSuccessResponseAsync(JsonElement id, Action<Utf8JsonWriter> writeResult, CancellationToken ct)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
@@ -290,11 +330,11 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
             writer.WritePropertyName("id");
             id.WriteTo(writer);
             writer.WritePropertyName("result");
-            JsonSerializer.Serialize(writer, result);
+            writeResult(writer);
             writer.WriteEndObject();
         }
 
-        string responseJson = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        string responseJson = Encoding.UTF8.GetString(stream.ToArray());
         await _transport.SendMessageAsync(responseJson, ct).ConfigureAwait(false);
     }
 
@@ -314,7 +354,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
             writer.WriteEndObject();
         }
 
-        string responseJson = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        string responseJson = Encoding.UTF8.GetString(stream.ToArray());
         await _transport.SendMessageAsync(responseJson, ct).ConfigureAwait(false);
     }
 

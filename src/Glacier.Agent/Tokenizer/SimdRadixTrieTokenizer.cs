@@ -2,16 +2,14 @@ namespace Glacier.Agent.Tokenizer;
 
 using System;
 using System.Buffers;
-using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Text;
 
 /// <summary>
-/// High-throughput SIMD-accelerated Radix Trie &amp; FST Tokenizer.
-/// Performs zero-allocation token encoding and decoding exceeding 50M tokens/sec.
+/// High-throughput SIMD-accelerated compressed Radix Trie Tokenizer.
+/// Supports full 256-way byte branching per node with zero silent edge drops and zero-allocation Span encoding/decoding.
 /// </summary>
 public sealed class SimdRadixTrieTokenizer : ITokenizer
 {
@@ -19,7 +17,8 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
     private readonly int[] _byteFallbackTokens = new int[256];
     private readonly int[] _nodeTokenIds;
     private readonly Vector256<byte>[] _nodeBranchVectors;
-    private readonly byte[] _nodeEdgeCounts;
+    private readonly ushort[] _nodeEdgeCounts;
+    private readonly byte[][] _nodeOverflowKeys;
     private readonly int[][] _nodeChildIndices;
     private readonly byte[][] _nodeEdgePrefixes;
     private readonly byte[][] _tokenToBytes;
@@ -31,7 +30,8 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
         int[] byteFallbackTokens,
         int[] nodeTokenIds,
         Vector256<byte>[] nodeBranchVectors,
-        byte[] nodeEdgeCounts,
+        ushort[] nodeEdgeCounts,
+        byte[][] nodeOverflowKeys,
         int[][] nodeChildIndices,
         byte[][] nodeEdgePrefixes,
         byte[][] tokenToBytes,
@@ -42,16 +42,13 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
         _nodeTokenIds = nodeTokenIds;
         _nodeBranchVectors = nodeBranchVectors;
         _nodeEdgeCounts = nodeEdgeCounts;
+        _nodeOverflowKeys = nodeOverflowKeys;
         _nodeChildIndices = nodeChildIndices;
         _nodeEdgePrefixes = nodeEdgePrefixes;
         _tokenToBytes = tokenToBytes;
         VocabularySize = vocabSize;
     }
 
-    /// <summary>
-    /// Creates a default tokenizer pre-populated with byte fallbacks, English word/subword patterns,
-    /// code syntax tokens, and special symbols.
-    /// </summary>
     public static SimdRadixTrieTokenizer CreateDefault()
     {
         var builder = new SimdRadixTrieBuilder();
@@ -97,7 +94,6 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
                     break;
                 }
 
-                // Check edge prefix if compressed radix path exists
                 byte[] prefix = _nodeEdgePrefixes[nextNode];
                 if (prefix.Length > 0)
                 {
@@ -234,9 +230,6 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
         return written;
     }
 
-    /// <summary>
-    /// Helper to decode into a managed string.
-    /// </summary>
     public string DecodeToString(ReadOnlySpan<int> tokens)
     {
         int totalBytes = 0;
@@ -249,7 +242,7 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
             }
         }
 
-        byte[] rented = ArrayPool<byte>.Shared.Rent(totalBytes);
+        byte[] rented = ArrayPool<byte>.Shared.Rent(Math.Max(1, totalBytes));
         try
         {
             int written = Decode(tokens, rented);
@@ -264,40 +257,50 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int FindChild(int nodeIdx, byte b)
     {
-        byte edgeCount = _nodeEdgeCounts[nodeIdx];
+        int edgeCount = _nodeEdgeCounts[nodeIdx];
         if (edgeCount == 0)
         {
             return -1;
         }
 
-        if (Vector256.IsHardwareAccelerated && edgeCount <= 32)
+        int simdCount = edgeCount > 32 ? 32 : edgeCount;
+        if (Vector256.IsHardwareAccelerated)
         {
             Vector256<byte> branchKeys = _nodeBranchVectors[nodeIdx];
             Vector256<byte> target = Vector256.Create(b);
             Vector256<byte> matches = Vector256.Equals(branchKeys, target);
             uint mask = matches.ExtractMostSignificantBits();
-            uint validMask = mask & ((1u << edgeCount) - 1u);
+            // Avoid C# 32-bit shift count wraparound ((1u << 32) == 1u)!
+            uint validMask = simdCount == 32 ? mask : (mask & ((1u << simdCount) - 1u));
             if (validMask != 0)
             {
                 int matchIndex = BitOperations.TrailingZeroCount(validMask);
                 return _nodeChildIndices[nodeIdx][matchIndex];
             }
-            return -1;
         }
         else
         {
+            Vector256<byte> branchKeys = _nodeBranchVectors[nodeIdx];
             int[] children = _nodeChildIndices[nodeIdx];
-            for (int i = 0; i < edgeCount; i++)
+            for (int i = 0; i < simdCount; i++)
             {
-                // Inspect branch keys directly
-                Vector256<byte> branchKeys = _nodeBranchVectors[nodeIdx];
                 if (branchKeys[i] == b)
                 {
                     return children[i];
                 }
             }
-            return -1;
         }
+
+        if (edgeCount > 32)
+        {
+            int overflowIdx = _nodeOverflowKeys[nodeIdx].AsSpan().IndexOf(b);
+            if (overflowIdx >= 0)
+            {
+                return _nodeChildIndices[nodeIdx][32 + overflowIdx];
+            }
+        }
+
+        return -1;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

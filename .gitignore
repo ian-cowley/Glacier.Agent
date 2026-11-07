@@ -2,6 +2,7 @@
 [Bb]in/
 [Oo]bj/
 [Rr]elease/
+TestResults/
 
 # IDE and editor folders
 .vs/
@@ -41,3 +42,8 @@ Thumbs.db
 # Scratch / working directories
 brain/
 scratch/
+
+# Secrets & environment files (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+*.env*

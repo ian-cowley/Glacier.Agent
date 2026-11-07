@@ -191,28 +191,32 @@ public sealed class HnswVectorIndex : IVectorIndex
             throw new ArgumentException($"Query vector length ({query.Length}) does not match index dimension ({_dimension}).", nameof(query));
         }
 
-        if (_entryPoint == -1 || _vectors.Count == 0 || topK <= 0)
+        int currObj;
+        int currMaxLayer;
+        lock (_globalLock)
         {
-            return 0;
+            if (_entryPoint == -1 || _vectors.Count == 0 || topK <= 0)
+            {
+                return 0;
+            }
+            currObj = _entryPoint;
+            currMaxLayer = _maxLayer;
         }
 
-        int currObj = _entryPoint;
-        int currMaxLayer = _maxLayer;
         float curDist = SimdDistance.Calculate(query, _vectors[currObj], _metric);
+        Span<int> neighborScratch = stackalloc int[Math.Max(64, _m0 + 2)];
 
-        // 1. Greedy descent down to layer 1
+        // 1. Greedy descent down to layer 1 (thread-safe snapshot under per-node lock)
         for (int l = currMaxLayer; l > 0; l--)
         {
             bool changed = true;
             while (changed)
             {
                 changed = false;
-                List<int> neighbors = _graph[currObj].Length > l ? _graph[currObj][l] : null!;
-                if (neighbors == null) break;
-
-                for (int i = 0; i < neighbors.Count; i++)
+                int nCount = CopyNeighbors(currObj, l, neighborScratch);
+                for (int i = 0; i < nCount; i++)
                 {
-                    int neighbor = neighbors[i];
+                    int neighbor = neighborScratch[i];
                     float d = SimdDistance.Calculate(query, _vectors[neighbor], _metric);
                     if (d < curDist)
                     {
@@ -251,6 +255,8 @@ public sealed class HnswVectorIndex : IVectorIndex
         nearest.Add(new Candidate(entryPoint, dEntry));
         visited.Add(entryPoint);
 
+        Span<int> neighborScratch = stackalloc int[Math.Max(64, _m0 + 2)];
+
         while (candidates.Count > 0)
         {
             candidates.TryDequeue(out int currNode, out float currDist);
@@ -261,13 +267,10 @@ public sealed class HnswVectorIndex : IVectorIndex
                 break;
             }
 
-            List<int> neighbors = _graph[currNode].Length > layer ? _graph[currNode][layer] : null!;
-            if (neighbors == null) continue;
-
-            int nSize = neighbors.Count;
+            int nSize = CopyNeighbors(currNode, layer, neighborScratch);
             for (int i = 0; i < nSize; i++)
             {
-                int neighbor = neighbors[i];
+                int neighbor = neighborScratch[i];
                 if (visited.Add(neighbor))
                 {
                     float d = SimdDistance.Calculate(query, _vectors[neighbor], _metric);
@@ -286,6 +289,22 @@ public sealed class HnswVectorIndex : IVectorIndex
         }
 
         return nearest;
+    }
+
+    private int CopyNeighbors(int nodeIdx, int layer, Span<int> destination)
+    {
+        lock (_nodeLocks[nodeIdx])
+        {
+            var layers = _graph[nodeIdx];
+            if (layer >= layers.Length) return 0;
+            var list = layers[layer];
+            int count = Math.Min(list.Count, destination.Length);
+            for (int i = 0; i < count; i++)
+            {
+                destination[i] = list[i];
+            }
+            return count;
+        }
     }
 
     private static void InsertSorted(List<Candidate> list, Candidate item)

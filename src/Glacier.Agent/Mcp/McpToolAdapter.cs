@@ -1,7 +1,6 @@
 namespace Glacier.Agent.Mcp;
 
 using System;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -15,7 +14,7 @@ public sealed class McpAgentToolAdapter : IAgentTool
 
     public string Name => _tool.Name;
     public string Description => _tool.Description;
-    public string ParameterJsonSchema => JsonSerializer.Serialize(_tool.InputSchema);
+    public string ParameterJsonSchema => _tool.GetInputSchemaJson();
 
     public McpAgentToolAdapter(McpClient client, McpTool tool)
     {

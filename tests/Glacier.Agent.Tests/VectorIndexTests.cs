@@ -13,15 +13,12 @@ public sealed class VectorIndexTests
         float[] a = [1f, 2f, 3f, 4f];
         float[] b = [2f, 3f, 4f, 5f];
 
-        // Squared L2 = (1-2)^2 + (2-3)^2 + (3-4)^2 + (4-5)^2 = 1 + 1 + 1 + 1 = 4.0
         float l2 = SimdDistance.SquaredL2(a, b);
         Assert.Equal(4.0f, l2, precision: 5);
 
-        // Dot product = 1*2 + 2*3 + 3*4 + 4*5 = 2 + 6 + 12 + 20 = 40.0
         float dot = SimdDistance.DotProduct(a, b);
         Assert.Equal(40.0f, dot, precision: 5);
 
-        // Self cosine distance = 0.0
         float cos = SimdDistance.CosineDistance(a, a);
         Assert.Equal(0.0f, cos, precision: 5);
     }
@@ -32,7 +29,6 @@ public sealed class VectorIndexTests
         const int dim = 16;
         using var index = new HnswVectorIndex(dim, DistanceMetric.SquaredL2, m: 8, efConstruction: 32, efSearch: 32);
 
-        // Insert 100 vectors
         var rand = new Random(42);
         float[][] testVectors = new float[100][];
         for (int i = 0; i < 100; i++)
@@ -47,16 +43,14 @@ public sealed class VectorIndexTests
 
         Assert.Equal(100, index.Count);
 
-        // Search for exact vector #15
         Span<long> outIds = stackalloc long[5];
         Span<float> outDistances = stackalloc float[5];
         int found = index.Search(testVectors[15], outIds, outDistances, topK: 5);
 
         Assert.True(found >= 1);
-        Assert.Equal(1015, outIds[0]); // ID = 15 + 1000
+        Assert.Equal(1015, outIds[0]);
         Assert.True(outDistances[0] < 1e-4f);
 
-        // Roundtrip Save & Load
         using var ms = new MemoryStream();
         index.Save(ms);
 
@@ -75,40 +69,47 @@ public sealed class VectorIndexTests
     }
 
     [Fact]
-    public void IvfPqVectorIndex_RecallAndRoundtripPersistence()
+    public void IvfPqVectorIndex_TrainRecallAndRoundtripPersistence()
     {
         const int dim = 16;
-        using var index = new IvfPqVectorIndex(dim, numSubVectors: 4, numClusters: 4, DistanceMetric.SquaredL2);
+        using var index = new IvfPqVectorIndex(dim, numSubVectors: 4, numClusters: 8, DistanceMetric.SquaredL2);
 
         var rand = new Random(99);
-        float[][] testVectors = new float[50][];
-        for (int i = 0; i < 50; i++)
+        float[][] testVectors = new float[60][];
+        for (int i = 0; i < 60; i++)
         {
             testVectors[i] = new float[dim];
             for (int d = 0; d < dim; d++)
             {
-                testVectors[i][d] = (float)rand.NextDouble();
+                testVectors[i][d] = (float)rand.NextDouble() + (i % 4) * 5f;
             }
+        }
+
+        index.Train(testVectors, maxIterations: 10);
+        Assert.True(index.IsTrained);
+
+        for (int i = 0; i < 60; i++)
+        {
             index.Add(i + 500, testVectors[i]);
         }
 
-        Assert.Equal(50, index.Count);
+        Assert.Equal(60, index.Count);
 
         Span<long> outIds = stackalloc long[3];
         Span<float> outDistances = stackalloc float[3];
         int found = index.Search(testVectors[10], outIds, outDistances, topK: 3);
 
         Assert.True(found > 0);
+        Assert.Equal(510, outIds[0]);
 
-        // Test serialization
         using var ms = new MemoryStream();
         index.Save(ms);
 
         ms.Position = 0;
-        using var loaded = new IvfPqVectorIndex(dim, numSubVectors: 4, numClusters: 4);
+        using var loaded = new IvfPqVectorIndex(dim, numSubVectors: 4, numClusters: 8);
         loaded.Load(ms);
 
-        Assert.Equal(50, loaded.Count);
+        Assert.Equal(60, loaded.Count);
 
         Span<long> loadedIds = stackalloc long[3];
         Span<float> loadedDists = stackalloc float[3];

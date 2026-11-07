@@ -2,6 +2,7 @@ namespace Glacier.Agent.Runtime;
 
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,13 +14,21 @@ public sealed record AgentStepDecision(
     string? ToolArgumentsJson = null);
 
 /// <summary>
-/// Autonomous agent execution engine coordinating step reasoning, tool execution, and reactive event publishing.
-/// Implements <see cref="IAgentRuntime"/>.
+/// Pluggable LLM completion backend for <see cref="AgentExecutionEngine"/> (e.g. Glacier.Inference or HTTP chat endpoint).
+/// </summary>
+public interface IAgentChatModel
+{
+    ValueTask<string> CompleteAsync(string systemPrompt, string userPrompt, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Autonomous agent execution engine coordinating LLM or structured tool-call planning, tool execution, and reactive event publishing.
 /// </summary>
 public sealed class AgentExecutionEngine : IAgentRuntime
 {
     private readonly AgentToolRegistry _tools = new();
     private readonly Func<AgentContext, IReadOnlyCollection<IAgentTool>, CancellationToken, ValueTask<AgentStepDecision>>? _stepPlanner;
+    private readonly IAgentChatModel? _chatModel;
 
     public string AgentId { get; }
     public AgentToolRegistry Tools => _tools;
@@ -34,10 +43,41 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         _stepPlanner = stepPlanner;
     }
 
+    public AgentExecutionEngine(string agentId, IAgentChatModel chatModel)
+    {
+        AgentId = agentId ?? throw new ArgumentNullException(nameof(agentId));
+        _chatModel = chatModel ?? throw new ArgumentNullException(nameof(chatModel));
+    }
+
     public void RegisterTool(IAgentTool tool)
     {
         _tools.Register(tool);
         PublishEvent("ToolRegistered", tool.Name);
+    }
+
+    public async ValueTask<AgentResponse> ExecuteLoopAsync(
+        string sessionId,
+        string initialPrompt,
+        int maxSteps = 8,
+        CancellationToken ct = default)
+    {
+        if (maxSteps <= 0) throw new ArgumentOutOfRangeException(nameof(maxSteps));
+
+        string currentPrompt = initialPrompt;
+        AgentResponse lastResponse = new(string.Empty, true);
+
+        for (int step = 1; step <= maxSteps; step++)
+        {
+            lastResponse = await ExecuteStepAsync(new AgentContext(sessionId, currentPrompt, step), ct).ConfigureAwait(false);
+            if (lastResponse.IsCompleted)
+            {
+                return lastResponse;
+            }
+
+            currentPrompt = $"{initialPrompt}\n<|tool_result|>{{\"tool\":\"{lastResponse.ToolCallName}\",\"output\":{JsonEncodeString(lastResponse.Output)}}}";
+        }
+
+        return new AgentResponse(lastResponse.Output, IsCompleted: true, lastResponse.ToolCallName);
     }
 
     public async ValueTask<AgentResponse> ExecuteStepAsync(AgentContext context, CancellationToken ct = default)
@@ -49,11 +89,15 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         {
             decision = await _stepPlanner(context, _tools.Tools, ct).ConfigureAwait(false);
         }
+        else if (_chatModel != null)
+        {
+            string sysPrompt = BuildToolSystemPrompt(_tools.Tools);
+            string completion = await _chatModel.CompleteAsync(sysPrompt, context.Prompt, ct).ConfigureAwait(false);
+            decision = ParseModelOrStructuredDirective(completion, isRawModelOutput: true);
+        }
         else
         {
-            // Default deterministic heuristic planner:
-            // Check if context prompt requests a tool: e.g., "CALL <tool_name>: <json_args>"
-            decision = EvaluateHeuristicPrompt(context);
+            decision = ParseModelOrStructuredDirective(context.Prompt, isRawModelOutput: false);
         }
 
         if (!string.IsNullOrWhiteSpace(decision.ToolName))
@@ -82,29 +126,118 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         return new AgentResponse(decision.Output, decision.IsCompleted);
     }
 
-    private AgentStepDecision EvaluateHeuristicPrompt(AgentContext context)
+    private static string BuildToolSystemPrompt(IReadOnlyCollection<IAgentTool> tools)
     {
-        string prompt = context.Prompt.Trim();
-
-        // Check for "CALL <tool>: <args>" or "tool:<tool_name>"
-        if (prompt.StartsWith("CALL ", StringComparison.OrdinalIgnoreCase))
+        var sb = new StringBuilder();
+        sb.AppendLine("You are an autonomous Glacier agent. When invoking a tool, respond ONLY with JSON: {\"tool\":\"<name>\",\"arguments\":{...}}.");
+        if (tools.Count > 0)
         {
-            string remainder = prompt.Substring(5).Trim();
-            int colonIdx = remainder.IndexOf(':');
-            if (colonIdx > 0)
+            sb.AppendLine("Available tools:");
+            foreach (var t in tools)
             {
-                string toolName = remainder.Substring(0, colonIdx).Trim();
-                string toolArgs = remainder.Substring(colonIdx + 1).Trim();
-                return new AgentStepDecision("Invoking tool " + toolName, false, toolName, toolArgs);
+                sb.Append("- ").Append(t.Name).Append(": ").Append(t.Description).Append(" | schema: ").AppendLine(t.ParameterJsonSchema);
             }
-            else
+        }
+        return sb.ToString();
+    }
+
+    public static AgentStepDecision ParseModelOrStructuredDirective(string rawInput, bool isRawModelOutput = false)
+    {
+        string trimmed = rawInput.Trim();
+
+        // 1. Support <|tool_call|>{...} tags
+        const string toolTag = "<|tool_call|>";
+        int tagIdx = trimmed.IndexOf(toolTag, StringComparison.OrdinalIgnoreCase);
+        if (tagIdx >= 0)
+        {
+            string afterTag = trimmed[(tagIdx + toolTag.Length)..].Trim();
+            int endTag = afterTag.IndexOf("<|", StringComparison.Ordinal);
+            if (endTag > 0) afterTag = afterTag[..endTag].Trim();
+            if (TryParseJsonToolCall(afterTag, out var taggedDecision))
             {
-                string toolName = remainder;
-                return new AgentStepDecision("Invoking tool " + toolName, false, toolName, "{}");
+                return taggedDecision;
             }
         }
 
-        return new AgentStepDecision($"Processed prompt: {prompt}", IsCompleted: true);
+        // 2. Support structured JSON {"tool":"...","arguments":{...}} or {"name":"...","arguments":{...}}
+        if (trimmed.StartsWith('{') && trimmed.EndsWith('}') && TryParseJsonToolCall(trimmed, out var jsonDecision))
+        {
+            return jsonDecision;
+        }
+
+        // 3. Support "CALL <tool>: <args>" or "tool:<tool> <args>"
+        if (trimmed.StartsWith("CALL ", StringComparison.OrdinalIgnoreCase))
+        {
+            string remainder = trimmed[5..].Trim();
+            int colonIdx = remainder.IndexOf(':');
+            if (colonIdx > 0)
+            {
+                string toolName = remainder[..colonIdx].Trim();
+                string toolArgs = remainder[(colonIdx + 1)..].Trim();
+                return new AgentStepDecision("Invoking tool " + toolName, false, toolName, string.IsNullOrEmpty(toolArgs) ? "{}" : toolArgs);
+            }
+            return new AgentStepDecision("Invoking tool " + remainder, false, remainder, "{}");
+        }
+
+        if (trimmed.StartsWith("tool:", StringComparison.OrdinalIgnoreCase))
+        {
+            string remainder = trimmed[5..].Trim();
+            int spaceIdx = remainder.IndexOfAny([' ', ':']);
+            if (spaceIdx > 0)
+            {
+                string toolName = remainder[..spaceIdx].Trim();
+                string toolArgs = remainder[(spaceIdx + 1)..].Trim();
+                return new AgentStepDecision("Invoking tool " + toolName, false, toolName, string.IsNullOrEmpty(toolArgs) ? "{}" : toolArgs);
+            }
+            return new AgentStepDecision("Invoking tool " + remainder, false, remainder, "{}");
+        }
+
+        string output = isRawModelOutput ? trimmed : $"Processed prompt: {trimmed}";
+        return new AgentStepDecision(output, IsCompleted: true);
+    }
+
+    private static bool TryParseJsonToolCall(string json, out AgentStepDecision decision)
+    {
+        decision = default!;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+
+            string? name = null;
+            if (root.TryGetProperty("tool", out var tProp) && tProp.ValueKind == JsonValueKind.String)
+                name = tProp.GetString();
+            else if (root.TryGetProperty("name", out var nProp) && nProp.ValueKind == JsonValueKind.String)
+                name = nProp.GetString();
+
+            if (string.IsNullOrWhiteSpace(name)) return false;
+
+            string argsJson = "{}";
+            if (root.TryGetProperty("arguments", out var argsProp))
+            {
+                argsJson = argsProp.ValueKind == JsonValueKind.String
+                    ? (argsProp.GetString() ?? "{}")
+                    : argsProp.GetRawText();
+            }
+
+            decision = new AgentStepDecision("Invoking tool " + name, false, name, argsJson);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string JsonEncodeString(string value)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStringValue(value);
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
     }
 
     private void PublishEvent(string eventType, string payload)

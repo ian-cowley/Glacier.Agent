@@ -10,16 +10,15 @@ using System.Threading.Tasks;
 
 /// <summary>
 /// Stream-backed MCP transport reading and writing newline-delimited JSON-RPC messages.
-/// Suitable for standard I/O (stdio) pipes, NetworkStreams, or named pipes.
+/// Thread-safe concurrent writes for standard I/O (stdio) pipes, NetworkStreams, or named pipes.
 /// </summary>
 public sealed class StreamMcpTransport : IMcpTransport
 {
     private readonly Stream _inputStream;
     private readonly Stream _outputStream;
     private readonly StreamReader _reader;
-    private readonly StreamWriter _writer;
-    private readonly Lock _writeLock = new();
-    private bool _isDisposed = false;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private volatile bool _isDisposed;
 
     public StreamMcpTransport(Stream stream) : this(stream, stream)
     {
@@ -30,10 +29,6 @@ public sealed class StreamMcpTransport : IMcpTransport
         _inputStream = inputStream ?? throw new ArgumentNullException(nameof(inputStream));
         _outputStream = outputStream ?? throw new ArgumentNullException(nameof(outputStream));
         _reader = new StreamReader(_inputStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
-        _writer = new StreamWriter(_outputStream, new UTF8Encoding(false), bufferSize: 4096, leaveOpen: true)
-        {
-            AutoFlush = true
-        };
     }
 
     public async ValueTask SendMessageAsync(string messageJson, CancellationToken ct = default)
@@ -41,8 +36,17 @@ public sealed class StreamMcpTransport : IMcpTransport
         if (_isDisposed) throw new ObjectDisposedException(nameof(StreamMcpTransport));
 
         byte[] bytes = Encoding.UTF8.GetBytes(messageJson + "\n");
-        await _outputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
-        await _outputStream.FlushAsync(ct).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_isDisposed) throw new ObjectDisposedException(nameof(StreamMcpTransport));
+            await _outputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+            await _outputStream.FlushAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async IAsyncEnumerable<string> ReadMessagesAsync([EnumeratorCancellation] CancellationToken ct = default)
@@ -64,21 +68,30 @@ public sealed class StreamMcpTransport : IMcpTransport
         }
     }
 
-    public ValueTask CloseAsync()
+    public async ValueTask CloseAsync()
     {
+        if (_isDisposed) return;
         _isDisposed = true;
-        _reader.Dispose();
-        _writer.Dispose();
-        return ValueTask.CompletedTask;
+        await _writeLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _reader.Dispose();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         await CloseAsync().ConfigureAwait(false);
+        _writeLock.Dispose();
     }
 
     public void Dispose()
     {
         CloseAsync().GetAwaiter().GetResult();
+        _writeLock.Dispose();
     }
 }

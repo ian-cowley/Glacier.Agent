@@ -66,7 +66,6 @@ public sealed class RuntimeTests
         var publishedEvents = new List<AgentEvent>();
         engine.EventPublished += evt => publishedEvents.Add(evt);
 
-        // Register custom tool
         var calculatorTool = DelegateAgentTool.Create(
             name: "calc",
             description: "Evaluates simple math",
@@ -85,5 +84,28 @@ public sealed class RuntimeTests
         Assert.True(publishedEvents.Count >= 3);
         Assert.Contains(publishedEvents, e => e.EventType == "ToolInvoking" && e.Payload == "calc");
         Assert.Contains(publishedEvents, e => e.EventType == "ToolCompleted");
+    }
+
+    private sealed class MockChatModel : IAgentChatModel
+    {
+        public ValueTask<string> CompleteAsync(string systemPrompt, string userPrompt, CancellationToken ct = default)
+        {
+            if (userPrompt.Contains("<|tool_result|>", StringComparison.Ordinal))
+            {
+                return ValueTask.FromResult("The answer is 42.");
+            }
+            return ValueTask.FromResult("""{"tool":"calc","arguments":{"expr":"6*7"}}""");
+        }
+    }
+
+    [Fact]
+    public async Task AgentExecutionEngine_WithChatModel_ExecutesMultiStepJsonToolLoop()
+    {
+        using var engine = new AgentExecutionEngine("agent-llm", new MockChatModel());
+        engine.RegisterTool(DelegateAgentTool.Create("calc", "Math", "{}", _ => "42"));
+
+        AgentResponse final = await engine.ExecuteLoopAsync("sess-loop", "What is 6*7?", maxSteps: 4);
+        Assert.True(final.IsCompleted);
+        Assert.Equal("The answer is 42.", final.Output);
     }
 }

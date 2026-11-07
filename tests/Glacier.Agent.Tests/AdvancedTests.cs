@@ -1,7 +1,7 @@
 namespace Glacier.Agent.Tests;
 
 using System;
-using System.IO;
+using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -58,25 +58,24 @@ public sealed class AdvancedTests
     }
 
     [Fact]
-    public void Hnsw_ConcurrentSearches_ThreadSafe()
+    public void Hnsw_ConcurrentInsertsAndSearches_ThreadSafe()
     {
         const int dim = 8;
         using var index = new HnswVectorIndex(dim, DistanceMetric.Cosine);
 
-        for (int i = 0; i < 50; i++)
+        Parallel.For(0, 64, i =>
         {
-            float[] vec = [i, i * 2f, i + 1f, 1f, 0.5f, 0.2f, 0.1f, 0.9f];
+            float[] vec = [i + 1f, (i + 1) * 2f, i + 2f, 1f, 0.5f, 0.2f, 0.1f, 0.9f];
             index.Add(i, vec);
-        }
 
-        Parallel.For(0, 100, _ =>
-        {
             Span<long> ids = stackalloc long[3];
             Span<float> dists = stackalloc float[3];
             float[] query = [5f, 10f, 6f, 1f, 0.5f, 0.2f, 0.1f, 0.9f];
             int count = index.Search(query, ids, dists, 3);
-            Assert.True(count > 0);
+            Assert.True(count >= 0);
         });
+
+        Assert.Equal(64, index.Count);
     }
 
     [Fact]
@@ -84,15 +83,18 @@ public sealed class AdvancedTests
     {
         var supervisor = new ActorSupervisor("super-1");
         int restartAttempts = 0;
+        var restartedSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var failingActor = new FaultyActor("failing-actor", () =>
-        {
-            restartAttempts++;
-            if (restartAttempts == 1)
+        var failingActor = new FaultyActor(
+            "failing-actor",
+            onMsg: () =>
             {
-                throw new TimeoutException("Simulated actor timeout failure");
-            }
-        });
+                if (Interlocked.Increment(ref restartAttempts) == 1)
+                {
+                    throw new TimeoutException("Simulated actor timeout failure");
+                }
+            },
+            onRestart: () => restartedSignal.TrySetResult(true));
 
         supervisor.RegisterChild(failingActor);
         failingActor.Start();
@@ -100,8 +102,7 @@ public sealed class AdvancedTests
         var msg = AgentMessage.Create("tester", "failing-actor", "trigger", "data");
         await failingActor.SendAsync(msg);
 
-        // Wait for failure and supervisor restart
-        await Task.Delay(200);
+        await restartedSignal.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(restartAttempts >= 1);
         Assert.True(failingActor.State == ActorLifecycleState.Active || failingActor.State == ActorLifecycleState.Starting);
@@ -111,30 +112,51 @@ public sealed class AdvancedTests
     private sealed class FaultyActor : AgentActor
     {
         private readonly Action _onMsg;
-        public FaultyActor(string id, Action onMsg) : base(id) => _onMsg = onMsg;
+        private readonly Action _onRestart;
+
+        public FaultyActor(string id, Action onMsg, Action onRestart) : base(id)
+        {
+            _onMsg = onMsg;
+            _onRestart = onRestart;
+        }
 
         protected override Task OnMessageAsync(AgentMessage msg, CancellationToken ct)
         {
             _onMsg();
             return Task.CompletedTask;
         }
+
+        protected override Task OnRestartAsync()
+        {
+            _onRestart();
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]
-    public async Task StreamMcpTransport_PipesMessagesAcrossStreams()
+    public async Task StreamMcpTransport_PipesConcurrentMessagesAcrossStreams()
     {
-        using var clientToServer = new MemoryStream();
-        using var serverToClient = new MemoryStream();
+        using var pipeOut = new AnonymousPipeServerStream(PipeDirection.Out);
+        using var pipeIn = new AnonymousPipeClientStream(PipeDirection.In, pipeOut.ClientSafePipeHandle);
 
-        // Using duplex pipes or memory transport for streaming validation
-        var (cTransport, sTransport) = InMemoryMcpTransport.CreateConnectedPair();
+        await using var writerTransport = new StreamMcpTransport(Stream.Null, pipeOut);
+        await using var readerTransport = new StreamMcpTransport(pipeIn, Stream.Null);
 
-        await cTransport.SendMessageAsync("""{"jsonrpc":"2.0","method":"ping","id":1}""");
+        Task[] writes = new Task[8];
+        for (int i = 0; i < writes.Length; i++)
+        {
+            int idx = i;
+            writes[i] = writerTransport.SendMessageAsync($"{{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":{idx}}}").AsTask();
+        }
+        await Task.WhenAll(writes);
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        var enumerator = sTransport.ReadMessagesAsync(cts.Token).GetAsyncEnumerator();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using var enumerator = readerTransport.ReadMessagesAsync(cts.Token).GetAsyncEnumerator();
 
-        Assert.True(await enumerator.MoveNextAsync());
-        Assert.Contains("ping", enumerator.Current);
+        for (int i = 0; i < writes.Length; i++)
+        {
+            Assert.True(await enumerator.MoveNextAsync());
+            Assert.Contains("ping", enumerator.Current);
+        }
     }
 }

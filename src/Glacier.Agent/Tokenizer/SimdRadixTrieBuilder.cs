@@ -6,13 +6,14 @@ using System.Runtime.Intrinsics;
 using System.Text;
 
 /// <summary>
-/// Builder to construct an optimized <see cref="SimdRadixTrieTokenizer"/>.
+/// Builder to construct a radix-compressed <see cref="SimdRadixTrieTokenizer"/> with full 256-way byte fanout.
 /// </summary>
 public sealed class SimdRadixTrieBuilder
 {
     private sealed class TempNode
     {
         public int TokenId = -1;
+        public byte[] EdgePrefix = Array.Empty<byte>();
         public readonly Dictionary<byte, TempNode> Children = new();
     }
 
@@ -23,7 +24,6 @@ public sealed class SimdRadixTrieBuilder
 
     public SimdRadixTrieBuilder()
     {
-        // Reserve byte fallback tokens 0..255
         for (int i = 0; i < 256; i++)
         {
             byte b = (byte)i;
@@ -32,23 +32,17 @@ public sealed class SimdRadixTrieBuilder
         _nextId = 256;
     }
 
-    /// <summary>
-    /// Adds a token string to the vocabulary with auto-assigned ID.
-    /// </summary>
     public int AddToken(string token)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(token);
         return AddToken(bytes);
     }
 
-    /// <summary>
-    /// Adds raw token bytes to the vocabulary with auto-assigned ID.
-    /// </summary>
     public int AddToken(byte[] tokenBytes)
     {
         if (tokenBytes.Length == 1)
         {
-            return tokenBytes[0]; // Byte fallback token
+            return tokenBytes[0];
         }
 
         string key = Encoding.UTF8.GetString(tokenBytes);
@@ -62,18 +56,12 @@ public sealed class SimdRadixTrieBuilder
         return id;
     }
 
-    /// <summary>
-    /// Adds a token with a specific token ID.
-    /// </summary>
     public void AddToken(string token, int tokenId)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(token);
         AddToken(bytes, tokenId);
     }
 
-    /// <summary>
-    /// Adds raw token bytes with a specific token ID.
-    /// </summary>
     public void AddToken(byte[] tokenBytes, int tokenId)
     {
         AddTokenInternal(tokenBytes, tokenId);
@@ -106,26 +94,16 @@ public sealed class SimdRadixTrieBuilder
         current.TokenId = id;
     }
 
-    /// <summary>
-    /// Populates standard vocabulary containing common English words, subwords, code keywords, and special tokens.
-    /// </summary>
     public void AddDefaultVocabulary()
     {
         string[] commonTokens =
         [
-            // Whitespace & control sequences
             " ", "  ", "   ", "    ", "        ", "\t", "\n", "\r\n", "\n\n",
-            
-            // Common punctuation & symbols
             ":", ";", ",", ".", "?", "!", "-", "_", "(", ")", "[", "]", "{", "}", "\"", "'", "`",
             "/", "\\", "|", "@", "#", "$", "%", "^", "&", "*", "+", "=", "<", ">", "~",
             "://", "://www.", "==", "!=", "<=", ">=", "=>", "->", "/*", "*/", "//",
-
-            // Special LLM / Agent tokens
             "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|tool_call|>", "<|tool_result|>",
             "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|context|>", "<|system|>", "<|user|>", "<|assistant|>",
-
-            // Programming keywords (C#, Python, Rust, SQL, JS, TS)
             "public", "private", "protected", "internal", "static", "readonly", "volatile",
             "class", "struct", "interface", "record", "enum", "namespace", "using",
             "void", "int", "long", "float", "double", "bool", "string", "char", "byte", "object",
@@ -137,8 +115,6 @@ public sealed class SimdRadixTrieBuilder
             "fn", "mut", "impl", "trait", "pub", "match", "loop", "unsafe", "ref", "out",
             "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "GROUP", "ORDER", "BY",
             "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "AND", "OR", "NOT", "NULL",
-
-            // Common English words (with and without space prefix)
             "the", " The", "the ", " of", "of ", " and", "and ", " to", "to ", " a", "a ", " in", "in ",
             " that", "that ", " is", "is ", " was", " was ", " for", "for ", " on", "on ", " with", "with ",
             " as", "as ", " by", "by ", " at", "at ", " an", "an ", " be", "be ", " this", "this ",
@@ -200,8 +176,51 @@ public sealed class SimdRadixTrieBuilder
     }
 
     /// <summary>
-    /// Compiles the collected vocabulary into an immutable <see cref="SimdRadixTrieTokenizer"/>.
+    /// Compresses unary non-terminal trie paths into contiguous radix edge prefixes (skipping root's direct children).
     /// </summary>
+    private static TempNode CompressSubtree(TempNode node, bool canCompressSelf)
+    {
+        if (canCompressSelf && node.TokenId < 0 && node.Children.Count == 1)
+        {
+            var prefixBytes = new List<byte>();
+            TempNode curr = node;
+            while (curr.TokenId < 0 && curr.Children.Count == 1)
+            {
+                byte onlyByte = 0;
+                TempNode? onlyChild = null;
+                foreach (var kvp in curr.Children)
+                {
+                    onlyByte = kvp.Key;
+                    onlyChild = kvp.Value;
+                }
+                prefixBytes.Add(onlyByte);
+                curr = onlyChild!;
+            }
+
+            var merged = new TempNode
+            {
+                TokenId = curr.TokenId,
+                EdgePrefix = prefixBytes.ToArray()
+            };
+            foreach (var (b, grandChild) in curr.Children)
+            {
+                merged.Children[b] = CompressSubtree(grandChild, canCompressSelf: true);
+            }
+            return merged;
+        }
+
+        var copy = new TempNode
+        {
+            TokenId = node.TokenId,
+            EdgePrefix = node.EdgePrefix
+        };
+        foreach (var (b, child) in node.Children)
+        {
+            copy.Children[b] = CompressSubtree(child, canCompressSelf: true);
+        }
+        return copy;
+    }
+
     public SimdRadixTrieTokenizer Build()
     {
         int[] rootTable = new int[256];
@@ -213,20 +232,19 @@ public sealed class SimdRadixTrieBuilder
             byteFallback[i] = i;
         }
 
-        // Flatten trie nodes via BFS
         var flatNodes = new List<TempNode>();
         var nodeToIdx = new Dictionary<TempNode, int>();
 
-        // Root is not in flatNodes; root children are mapped directly in rootTable
-        foreach (var (b, child) in _root.Children)
+        // Root's direct children are 1-byte transitions indexed by rootTable[b] (cannot fold EdgePrefix into rootTable)
+        foreach (var (b, rawChild) in _root.Children)
         {
+            TempNode compressedChild = CompressSubtree(rawChild, canCompressSelf: false);
             int idx = flatNodes.Count;
-            flatNodes.Add(child);
-            nodeToIdx[child] = idx;
+            flatNodes.Add(compressedChild);
+            nodeToIdx[compressedChild] = idx;
             rootTable[b] = idx;
         }
 
-        // BFS for remaining descendants
         int head = 0;
         while (head < flatNodes.Count)
         {
@@ -245,7 +263,8 @@ public sealed class SimdRadixTrieBuilder
         int nodeCount = flatNodes.Count;
         int[] nodeTokenIds = new int[nodeCount];
         Vector256<byte>[] nodeBranchVectors = new Vector256<byte>[nodeCount];
-        byte[] nodeEdgeCounts = new byte[nodeCount];
+        ushort[] nodeEdgeCounts = new ushort[nodeCount];
+        byte[][] nodeOverflowKeys = new byte[nodeCount][];
         int[][] nodeChildIndices = new int[nodeCount][];
         byte[][] nodeEdgePrefixes = new byte[nodeCount][];
 
@@ -255,13 +274,14 @@ public sealed class SimdRadixTrieBuilder
         {
             TempNode node = flatNodes[i];
             nodeTokenIds[i] = node.TokenId;
-            nodeEdgePrefixes[i] = Array.Empty<byte>();
+            nodeEdgePrefixes[i] = node.EdgePrefix;
 
-            int count = Math.Min(node.Children.Count, 32);
-            nodeEdgeCounts[i] = (byte)count;
+            int count = node.Children.Count;
+            nodeEdgeCounts[i] = (ushort)count;
 
             branchBuffer.Clear();
-            int[] childIndices = new int[count];
+            int[] childIndices = count > 0 ? new int[count] : Array.Empty<int>();
+            byte[] overflowKeys = count > 32 ? new byte[count - 32] : Array.Empty<byte>();
 
             int idx = 0;
             foreach (var (b, child) in node.Children)
@@ -269,12 +289,17 @@ public sealed class SimdRadixTrieBuilder
                 if (idx < 32)
                 {
                     branchBuffer[idx] = b;
-                    childIndices[idx] = nodeToIdx[child];
-                    idx++;
                 }
+                else
+                {
+                    overflowKeys[idx - 32] = b;
+                }
+                childIndices[idx] = nodeToIdx[child];
+                idx++;
             }
 
             nodeBranchVectors[i] = Vector256.Create<byte>(branchBuffer);
+            nodeOverflowKeys[i] = overflowKeys;
             nodeChildIndices[i] = childIndices;
         }
 
@@ -286,6 +311,7 @@ public sealed class SimdRadixTrieBuilder
             nodeTokenIds,
             nodeBranchVectors,
             nodeEdgeCounts,
+            nodeOverflowKeys,
             nodeChildIndices,
             nodeEdgePrefixes,
             tokenToBytes,
