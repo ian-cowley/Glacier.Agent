@@ -6,6 +6,9 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Clavier.Engine;
+using Glacier.MemEx;
+using Glacier.MemEx.Models;
 
 public sealed record AgentStepDecision(
     string Output,
@@ -29,9 +32,15 @@ public sealed class AgentExecutionEngine : IAgentRuntime
     private readonly AgentToolRegistry _tools = new();
     private readonly Func<AgentContext, IReadOnlyCollection<IAgentTool>, CancellationToken, ValueTask<AgentStepDecision>>? _stepPlanner;
     private readonly IAgentChatModel? _chatModel;
+    private MemExEngine? _memory;
+    private int _recallBudgetTokens = 512;
+    private ClavierSession? _clavierSession;
+    private float _conformalAlpha = 0.05f;
 
     public string AgentId { get; }
     public AgentToolRegistry Tools => _tools;
+    public MemExEngine? EpisodicMemory => _memory;
+    public ClavierSession? ConformalRouter => _clavierSession;
 
     public event Action<AgentEvent>? EventPublished;
 
@@ -49,6 +58,19 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         _chatModel = chatModel ?? throw new ArgumentNullException(nameof(chatModel));
     }
 
+    public void AttachEpisodicMemory(MemExEngine memory, int recallBudgetTokens = 512)
+    {
+        _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+        if (recallBudgetTokens <= 0) throw new ArgumentOutOfRangeException(nameof(recallBudgetTokens));
+        _recallBudgetTokens = recallBudgetTokens;
+    }
+
+    public void AttachConformalRouter(ClavierSession clavierSession, float conformalAlpha = 0.05f)
+    {
+        _clavierSession = clavierSession ?? throw new ArgumentNullException(nameof(clavierSession));
+        _conformalAlpha = conformalAlpha;
+    }
+
     public void RegisterTool(IAgentTool tool)
     {
         _tools.Register(tool);
@@ -64,6 +86,16 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         if (maxSteps <= 0) throw new ArgumentOutOfRangeException(nameof(maxSteps));
 
         string currentPrompt = initialPrompt;
+        if (_memory != null && _memory.Count > 0)
+        {
+            var recalled = _memory.Query(initialPrompt, ReadOnlySpan<float>.Empty, maxTokens: _recallBudgetTokens);
+            if (!string.IsNullOrWhiteSpace(recalled.FormattedContext))
+            {
+                PublishEvent("MemoryRecalled", $"Traces: {recalled.SelectedTraces.Count}, Tokens: {recalled.TotalTokens}");
+                currentPrompt = $"[EPISODIC MEMORY]\n{recalled.FormattedContext}\n\n[USER PROMPT]\n{initialPrompt}";
+            }
+        }
+
         AgentResponse lastResponse = new(string.Empty, true);
 
         for (int step = 1; step <= maxSteps; step++)
@@ -71,12 +103,22 @@ public sealed class AgentExecutionEngine : IAgentRuntime
             lastResponse = await ExecuteStepAsync(new AgentContext(sessionId, currentPrompt, step), ct).ConfigureAwait(false);
             if (lastResponse.IsCompleted)
             {
+                _memory?.StoreTrace(new EpisodicTrace
+                {
+                    Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
+                    BaseImportance = 2.0f
+                });
                 return lastResponse;
             }
 
             currentPrompt = $"{initialPrompt}\n<|tool_result|>{{\"tool\":\"{lastResponse.ToolCallName}\",\"output\":{JsonEncodeString(lastResponse.Output)}}}";
         }
 
+        _memory?.StoreTrace(new EpisodicTrace
+        {
+            Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
+            BaseImportance = 1.5f
+        });
         return new AgentResponse(lastResponse.Output, IsCompleted: true, lastResponse.ToolCallName);
     }
 
@@ -84,20 +126,43 @@ public sealed class AgentExecutionEngine : IAgentRuntime
     {
         PublishEvent("StepStarting", $"Step: {context.StepCount}, Session: {context.SessionId}");
 
-        AgentStepDecision decision;
-        if (_stepPlanner != null)
+        AgentStepDecision? decision = null;
+        if (_clavierSession != null && context.StepCount == 1 && _tools.Tools.Count > 0)
         {
-            decision = await _stepPlanner(context, _tools.Tools, ct).ConfigureAwait(false);
+            var toolNames = new string[_tools.Tools.Count];
+            int idx = 0;
+            foreach (var t in _tools.Tools) toolNames[idx++] = t.Name;
+
+            var predictionSet = _clavierSession.DecideConformalSet(context.Prompt, _conformalAlpha, toolNames);
+            if (predictionSet.IsSystem1Eligible &&
+                !string.IsNullOrWhiteSpace(predictionSet.BestActionName) &&
+                _tools.TryGetTool(predictionSet.BestActionName, out _))
+            {
+                PublishEvent("ConformalFastDispatch", $"{predictionSet.BestActionName} (conf={predictionSet.BestConfidence:F3})");
+                decision = new AgentStepDecision(string.Empty, IsCompleted: false, ToolName: predictionSet.BestActionName, ToolArgumentsJson: "{}");
+            }
+            else
+            {
+                PublishEvent("ConformalEscalated", predictionSet.EscalationReason.ToString());
+            }
         }
-        else if (_chatModel != null)
+
+        if (decision == null)
         {
-            string sysPrompt = BuildToolSystemPrompt(_tools.Tools);
-            string completion = await _chatModel.CompleteAsync(sysPrompt, context.Prompt, ct).ConfigureAwait(false);
-            decision = ParseModelOrStructuredDirective(completion, isRawModelOutput: true);
-        }
-        else
-        {
-            decision = ParseModelOrStructuredDirective(context.Prompt, isRawModelOutput: false);
+            if (_stepPlanner != null)
+            {
+                decision = await _stepPlanner(context, _tools.Tools, ct).ConfigureAwait(false);
+            }
+            else if (_chatModel != null)
+            {
+                string sysPrompt = BuildToolSystemPrompt(_tools.Tools);
+                string completion = await _chatModel.CompleteAsync(sysPrompt, context.Prompt, ct).ConfigureAwait(false);
+                decision = ParseModelOrStructuredDirective(completion, isRawModelOutput: true);
+            }
+            else
+            {
+                decision = ParseModelOrStructuredDirective(context.Prompt, isRawModelOutput: false);
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(decision.ToolName))

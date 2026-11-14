@@ -108,4 +108,48 @@ public sealed class RuntimeTests
         Assert.True(final.IsCompleted);
         Assert.Equal("The answer is 42.", final.Output);
     }
+
+    [Fact]
+    public async Task AgentExecutionEngine_WithEpisodicMemory_RecallsAndStoresTraces()
+    {
+        var memory = new Glacier.MemEx.MemExEngine();
+        memory.StoreTrace(new Glacier.MemEx.Models.EpisodicTrace
+        {
+            Id = "mem-1",
+            Content = "User prefers metric units.",
+            BaseImportance = 4.0f
+        });
+
+        string? observedPrompt = null;
+        using var engine = new AgentExecutionEngine("agent-mem", (ctx, _, _) =>
+        {
+            observedPrompt = ctx.Prompt;
+            return ValueTask.FromResult(new AgentStepDecision("21C", IsCompleted: true));
+        });
+        engine.AttachEpisodicMemory(memory);
+
+        var res = await engine.ExecuteLoopAsync("sess-mem", "What is the temperature?", maxSteps: 2);
+        Assert.True(res.IsCompleted);
+        Assert.NotNull(observedPrompt);
+        Assert.Contains("[EPISODIC MEMORY]", observedPrompt);
+        Assert.Contains("metric units", observedPrompt);
+        Assert.Equal(2, memory.Count);
+    }
+
+    [Fact]
+    public async Task AgentExecutionEngine_WithConformalRouter_EscalatesOrFastDispatches()
+    {
+        using var clavier = new Glacier.Clavier.Engine.ClavierSession(embeddingDim: 16, hiddenDim: 16, numActions: 2);
+        using var engine = new AgentExecutionEngine("agent-clavier", new MockChatModel());
+        engine.RegisterTool(DelegateAgentTool.Create("calc", "Math", "{}", _ => "42"));
+        engine.RegisterTool(DelegateAgentTool.Create("search", "Search", "{}", _ => "found"));
+        engine.AttachConformalRouter(clavier, conformalAlpha: 0.05f);
+
+        var events = new List<string>();
+        engine.EventPublished += ev => events.Add(ev.EventType);
+
+        AgentResponse final = await engine.ExecuteLoopAsync("sess-clavier", "What is 6*7?", maxSteps: 4);
+        Assert.True(final.IsCompleted);
+        Assert.True(events.Contains("ConformalFastDispatch") || events.Contains("ConformalEscalated"));
+    }
 }
