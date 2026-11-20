@@ -39,3 +39,26 @@ public sealed class AgentToolAdapter : ITool
         return await _inner.ExecuteAsync(arguments, CancellationToken.None).ConfigureAwait(false);
     }
 }
+
+/// <summary>
+/// Adapts a <see cref="ITool"/> into an <see cref="IAgentTool"/> for <see cref="Glacier.Agent.Runtime.AgentExecutionEngine"/>.
+/// </summary>
+public sealed class ToolToAgentToolAdapter : IAgentTool
+{
+    private readonly ITool _inner;
+
+    public string Name => _inner.Name;
+    public string Description => _inner.Description;
+    public string ParameterJsonSchema => _inner.GetParametersSchema().ToJsonString();
+
+    public ToolToAgentToolAdapter(ITool inner)
+    {
+        _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+    }
+
+    public async ValueTask<string> ExecuteAsync(string argumentsJson, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return await _inner.ExecuteAsync(argumentsJson).ConfigureAwait(false);
+    }
+}

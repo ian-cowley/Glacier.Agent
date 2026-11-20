@@ -92,7 +92,23 @@ public readonly record struct AgentContext(string SessionId, string Prompt, int 
 /// <summary>
 /// Result of an agent execution step.
 /// </summary>
-public readonly record struct AgentResponse(string Output, bool IsCompleted, string? ToolCallName = null);
+public readonly record struct AgentResponse(string Output, bool IsCompleted, string? ToolCallName = null)
+{
+    /// <summary>
+    /// Verification status associated with this response, if verification was evaluated.
+    /// </summary>
+    public VerificationStatus VerificationStatus { get; init; } = VerificationStatus.None;
+
+    /// <summary>
+    /// Detailed verification result associated with this response, if available.
+    /// </summary>
+    public VerificationResult? VerificationResult { get; init; } = null;
+
+    /// <summary>
+    /// Indicates whether execution halted due to the verification circuit breaker tripping.
+    /// </summary>
+    public bool IsVerificationCircuitBreakerTripped => VerificationStatus == VerificationStatus.CircuitBreakerTripped;
+}
 
 /// <summary>
 /// Reactive event emitted by an agent.

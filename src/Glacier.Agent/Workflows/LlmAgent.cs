@@ -19,6 +19,9 @@ public class LlmAgent : IAgent
     public IApprovalService? ApprovalService { get; set; }
     public Func<ITool, string, Task<string>>? BeforeToolCall { get; set; }
     public int MaxRetries { get; set; } = 3;
+    public VerificationOptions? VerificationOptions { get; set; }
+    public VerificationCircuitBreakerState? LastVerificationState { get; private set; }
+    public VerificationResult? LastVerificationResult { get; private set; }
 
     private int _currentRetryCount;
     private readonly ISessionProvider? _sessionProvider;
@@ -63,6 +66,9 @@ public class LlmAgent : IAgent
         var userMessage = LlmContent.User(prompt);
         History.Add(userMessage);
         _currentRetryCount = 0;
+        var verificationBreaker = CreatePerRunVerificationBreaker();
+        LastVerificationState = verificationBreaker?.GetState();
+        LastVerificationResult = null;
         await SaveMessageAsync(sessionId, userMessage).ConfigureAwait(false);
 
         while (true)
@@ -87,7 +93,15 @@ public class LlmAgent : IAgent
                     continue;
                 }
 
-                await HandleToolCallsAsync(response.FunctionCalls, sessionId).ConfigureAwait(false);
+                var (tripped, haltedOutput) = await HandleToolCallsAsync(response.FunctionCalls, sessionId, verificationBreaker).ConfigureAwait(false);
+                if (tripped)
+                {
+                    if (VerificationOptions?.ThrowOnCircuitBreakerTripped == true && LastVerificationState != null && LastVerificationResult != null)
+                    {
+                        throw new VerificationCircuitBreakerException(LastVerificationState, LastVerificationResult);
+                    }
+                    return haltedOutput ?? LastVerificationResult?.ToJson() ?? "Verification circuit breaker tripped.";
+                }
                 continue;
             }
 
@@ -120,6 +134,9 @@ public class LlmAgent : IAgent
         var userMessage = LlmContent.User(prompt);
         History.Add(userMessage);
         _currentRetryCount = 0;
+        var verificationBreaker = CreatePerRunVerificationBreaker();
+        LastVerificationState = verificationBreaker?.GetState();
+        LastVerificationResult = null;
         await SaveMessageAsync(sessionId, userMessage).ConfigureAwait(false);
 
         while (true)
@@ -161,7 +178,16 @@ public class LlmAgent : IAgent
                     continue;
                 }
 
-                await HandleToolCallsAsync(toolCalls, sessionId).ConfigureAwait(false);
+                var (tripped, haltedOutput) = await HandleToolCallsAsync(toolCalls, sessionId, verificationBreaker).ConfigureAwait(false);
+                if (tripped)
+                {
+                    if (VerificationOptions?.ThrowOnCircuitBreakerTripped == true && LastVerificationState != null && LastVerificationResult != null)
+                    {
+                        throw new VerificationCircuitBreakerException(LastVerificationState, LastVerificationResult);
+                    }
+                    yield return haltedOutput ?? LastVerificationResult?.ToJson() ?? "Verification circuit breaker tripped.";
+                    yield break;
+                }
                 continue;
             }
 
@@ -187,12 +213,17 @@ public class LlmAgent : IAgent
         };
     }
 
-    private async Task HandleToolCallsAsync(List<LlmFunctionCall> toolCalls, string? sessionId)
+    private async Task<(bool Tripped, string? HaltedOutput)> HandleToolCallsAsync(
+        List<LlmFunctionCall> toolCalls,
+        string? sessionId,
+        VerificationCircuitBreaker? verificationBreaker)
     {
         using var toolActivity = Telemetry.ActivitySource.StartActivity($"ToolCalls {Name}");
 
         var responseParts = new List<LlmPart>(toolCalls.Count);
         var toolResultParts = new List<LlmPart>(toolCalls.Count);
+        bool tripped = false;
+        string? haltedOutput = null;
 
         foreach (var call in toolCalls)
         {
@@ -200,6 +231,7 @@ public class LlmAgent : IAgent
 
             var tool = Tools.FirstOrDefault(t => t.Name == call.Name);
             string result;
+            bool toolThrew = false;
 
             if (tool is null)
             {
@@ -256,9 +288,61 @@ public class LlmAgent : IAgent
                 }
                 catch (Exception ex)
                 {
+                    toolThrew = true;
                     callActivity?.SetTag("status", "error");
                     callActivity?.SetTag("error", ex.Message);
                     result = BuildErrorJson(ex.Message);
+                }
+
+                if (IsVerificationTool(tool))
+                {
+                    var metricTags = new[]
+                    {
+                        new KeyValuePair<string, object?>("agent", Name),
+                        new KeyValuePair<string, object?>("runtime", "LlmAgent")
+                    };
+                    Telemetry.VerificationAttemptsCounter.Add(1, metricTags);
+
+                    VerificationCircuitBreakerState state;
+                    if (tool is SelfVerificationTool { CircuitBreaker: not null } selfVerifyTool)
+                    {
+                        state = toolThrew
+                            ? selfVerifyTool.CircuitBreaker.RecordFailure(VerificationResult.Error(result, tool.Name))
+                            : selfVerifyTool.CircuitBreaker.GetState();
+                    }
+                    else
+                    {
+                        verificationBreaker ??= new VerificationCircuitBreaker(VerificationOptions?.MaxConsecutiveVerificationRetries ?? 3);
+                        var parsed = toolThrew
+                            ? VerificationResult.Error(result, tool.Name)
+                            : VerificationResultParser.Parse(result, tool.Name);
+                        state = parsed.Passed
+                            ? verificationBreaker.RecordSuccess(parsed)
+                            : verificationBreaker.RecordFailure(parsed);
+                    }
+
+                    LastVerificationState = state;
+                    LastVerificationResult = state.LastResult;
+
+                    if (state.LastResult?.Passed == true)
+                    {
+                        Telemetry.VerificationPassesCounter.Add(1, metricTags);
+                    }
+                    else
+                    {
+                        Telemetry.VerificationFailuresCounter.Add(1, metricTags);
+                        if (state.IsTripped)
+                        {
+                            Telemetry.CircuitBreakerTripsCounter.Add(1, metricTags);
+                            if (VerificationOptions?.HaltOnCircuitBreaker ?? true)
+                            {
+                                tripped = true;
+                                haltedOutput = VerificationOptions?.CircuitBreakerOutputFormatter != null
+                                    ? VerificationOptions.CircuitBreakerOutputFormatter(state.LastResult!, state, result)
+                                    : state.LastResult!.ToJson();
+                            }
+                        }
+                    }
                 }
             }
 
@@ -271,6 +355,11 @@ public class LlmAgent : IAgent
                     Response = TryParseOrWrap(result)
                 }
             });
+
+            if (tripped)
+            {
+                break;
+            }
         }
 
         var modelTurn = new LlmContent { Role = "model", Parts = responseParts };
@@ -281,6 +370,38 @@ public class LlmAgent : IAgent
 
         await SaveMessageAsync(sessionId, modelTurn).ConfigureAwait(false);
         await SaveMessageAsync(sessionId, functionTurn).ConfigureAwait(false);
+
+        return (tripped, haltedOutput);
+    }
+
+    private VerificationCircuitBreaker? CreatePerRunVerificationBreaker()
+    {
+        if (VerificationOptions != null || Tools.Any(IsVerificationTool))
+        {
+            return new VerificationCircuitBreaker(VerificationOptions?.MaxConsecutiveVerificationRetries ?? 3);
+        }
+        return null;
+    }
+
+    private bool IsVerificationTool(ITool tool)
+    {
+        if (tool is IVerificationTool)
+        {
+            return true;
+        }
+        if (string.Equals(tool.Name, SelfVerificationTool.DefaultToolName, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (VerificationOptions != null)
+        {
+            if (string.Equals(tool.Name, VerificationOptions.VerificationToolName, StringComparison.OrdinalIgnoreCase)
+                || VerificationOptions.VerificationToolNames.Contains(tool.Name))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private async Task LoadHistoryAsync(string? sessionId)
