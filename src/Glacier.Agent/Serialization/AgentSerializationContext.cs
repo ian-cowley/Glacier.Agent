@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using Glacier.Agent.Sandbox;
 
 namespace Glacier.Agent.Serialization;
 
@@ -32,6 +33,8 @@ namespace Glacier.Agent.Serialization;
 [JsonSerializable(typeof(ToolErrorPayload))]
 [JsonSerializable(typeof(VerificationFeedbackPayload))]
 [JsonSerializable(typeof(SelfVerificationToolArgs))]
+[JsonSerializable(typeof(SandboxOptions))]
+[JsonSerializable(typeof(SandboxExecutionResult))]
 [JsonSerializable(typeof(List<string>))]
 public partial class AdkJsonContext : JsonSerializerContext
 {
@@ -44,6 +47,7 @@ public partial class AdkJsonContext : JsonSerializerContext
     WriteIndented = true)]
 [JsonSerializable(typeof(List<LlmContent>))]
 [JsonSerializable(typeof(VerificationResult))]
+[JsonSerializable(typeof(SandboxExecutionResult))]
 public partial class AdkIndentedJsonContext : JsonSerializerContext
 {
 }

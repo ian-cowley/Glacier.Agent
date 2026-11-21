@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Agent.Llm;
 using Glacier.Agent.Runtime;
+using Glacier.Agent.Sandbox;
 using Glacier.Agent.Serialization;
 using Glacier.Agent.Tools;
 using Glacier.Agent.Workflows;
@@ -261,5 +264,83 @@ public sealed class Tier5AdversarialAgentTests
         Assert.Equal(VerificationStatus.CircuitBreakerTripped, resp2.VerificationStatus);
         Assert.True(extBreaker2.IsTripped);
         Assert.Equal(2, extBreaker2.ConsecutiveFailures);
+    }
+}
+
+[CollectionDefinition("ProcessAndTimingSensitive", DisableParallelization = true)]
+public sealed class ProcessAndTimingSensitiveCollection
+{
+}
+
+[Trait("Tier", "Tier5")]
+[Collection("ProcessAndTimingSensitive")]
+public sealed class Tier5SandboxContentionTests
+{
+    [Fact]
+    public async Task Tier5_OsProcessSandbox_ConcurrentExecutionUnderGcAndThreadPoolContention_NeverDeadlocks()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var sandbox = new OsProcessSandbox();
+        string exe = File.Exists("/bin/true") ? "/bin/true" : "/bin/sh";
+        string[] args = exe == "/bin/true" ? Array.Empty<string>() : new[] { "-c", "exit 0" };
+        var options = new SandboxOptions
+        {
+            ExecutablePath = exe,
+            Arguments = args,
+            EnableNamespaceIsolation = true,
+            AllowNetwork = false,
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+
+        using var stopGcCts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+
+        // Aggressively induce GC suspension (g_SuspendMutex / SuspendEE) and ThreadPool churn
+        // while concurrent clone3/fork sandbox spawns execute.
+        Task[] gcChurnTasks = Enumerable.Range(0, 4).Select(workerId => Task.Run(async () =>
+        {
+            int iter = 0;
+            while (!stopGcCts.IsCancellationRequested)
+            {
+                byte[] junk = new byte[16 * 1024 + (iter & 255)];
+                junk[0] = (byte)(workerId + iter);
+                if ((iter++ & 7) == 0)
+                {
+                    GC.Collect(iter % 3, GCCollectionMode.Forced, blocking: false);
+                }
+                await Task.Yield();
+            }
+        }, CancellationToken.None)).ToArray();
+
+        try
+        {
+            const int concurrentWorkers = 4;
+            const int spawnsPerWorker = 15;
+            Task[] spawnTasks = Enumerable.Range(0, concurrentWorkers).Select(_ => Task.Run(async () =>
+            {
+                for (int i = 0; i < spawnsPerWorker; i++)
+                {
+                    SandboxExecutionResult result = await sandbox.ExecuteAsync(options, stopGcCts.Token);
+                    Assert.True(result.Succeeded, $"Sandbox spawn failed under GC contention: exit={result.ExitCode}, err={result.StandardError}");
+                    Assert.False(result.TimedOut);
+                }
+            }, stopGcCts.Token)).ToArray();
+
+            await Task.WhenAll(spawnTasks);
+        }
+        finally
+        {
+            stopGcCts.Cancel();
+            await Task.WhenAll(gcChurnTasks);
+        }
+
+        if (RuntimeInformation.ProcessArchitecture == Architecture.X64)
+        {
+            string maps = await File.ReadAllTextAsync("/proc/self/maps");
+            Assert.Contains("libglacier_sandbox.so", maps, StringComparison.Ordinal);
+        }
     }
 }

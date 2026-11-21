@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Glacier.Agent.CommandLine;
 using Xunit;
 
+[Collection("ProcessAndTimingSensitive")]
 public sealed class CommandLineTests
 {
     [Fact]

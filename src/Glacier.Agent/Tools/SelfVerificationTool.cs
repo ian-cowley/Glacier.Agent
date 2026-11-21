@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Agent.Sandbox;
 
 /// <summary>
 /// AOT-safe self-verification tool implementing both <see cref="ITool"/> (Workflows) and
@@ -25,6 +26,7 @@ public sealed class SelfVerificationTool : ITool, IVerificationTool
     public string Description { get; }
     public string ParameterJsonSchema => CachedSchemaJson;
     public VerificationCircuitBreaker? CircuitBreaker => _circuitBreaker;
+    public ISandboxExecutor? SandboxExecutor => (_hook as SandboxVerificationHook)?.SandboxExecutor;
 
     public SelfVerificationTool(
         IVerificationHook? hook = null,
@@ -42,6 +44,40 @@ public sealed class SelfVerificationTool : ITool, IVerificationTool
         _circuitBreaker = circuitBreaker;
         _treatHookExceptionAsFailure = treatHookExceptionAsFailure;
     }
+
+    public SelfVerificationTool(
+        ISandboxExecutor sandboxExecutor,
+        Func<VerificationContext, SandboxOptions> sandboxOptionsFactory,
+        Func<SandboxExecutionResult, VerificationContext, VerificationResult>? sandboxResultEvaluator = null,
+        VerificationCircuitBreaker? circuitBreaker = null,
+        string name = DefaultToolName,
+        string? description = null,
+        bool treatHookExceptionAsFailure = true)
+        : this(
+            new SandboxVerificationHook(sandboxExecutor, sandboxOptionsFactory, sandboxResultEvaluator),
+            circuitBreaker,
+            name,
+            description,
+            treatHookExceptionAsFailure)
+    {
+    }
+
+    public static SelfVerificationTool CreateSandboxed(
+        Func<VerificationContext, SandboxOptions> sandboxOptionsFactory,
+        ISandboxExecutor? sandboxExecutor = null,
+        Func<SandboxExecutionResult, VerificationContext, VerificationResult>? sandboxResultEvaluator = null,
+        VerificationCircuitBreaker? circuitBreaker = null,
+        string name = DefaultToolName,
+        string? description = null,
+        bool treatHookExceptionAsFailure = true)
+        => new(
+            sandboxExecutor ?? new OsProcessSandbox(),
+            sandboxOptionsFactory,
+            sandboxResultEvaluator,
+            circuitBreaker,
+            name,
+            description,
+            treatHookExceptionAsFailure);
 
     public JsonNode GetParametersSchema() => CreateParametersSchema();
 
