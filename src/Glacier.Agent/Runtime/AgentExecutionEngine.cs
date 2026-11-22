@@ -37,6 +37,8 @@ public sealed class AgentExecutionEngine : IAgentRuntime
     private readonly List<IVerificationHook> _verificationHooks = new();
     private readonly HashSet<string> _verificationToolNames = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, VerificationCircuitBreaker> _sessionBreakers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, int> _activeSessionLoops = new(StringComparer.Ordinal);
+    private readonly AsyncLocal<VerificationCircuitBreaker?> _currentLoopBreaker = new();
     private VerificationOptions _verificationOptions = new();
     private MemExEngine? _memory;
     private int _recallBudgetTokens = 512;
@@ -139,211 +141,240 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         if (maxSteps <= 0) throw new ArgumentOutOfRangeException(nameof(maxSteps));
 
         var loopBreaker = new VerificationCircuitBreaker(_verificationOptions.MaxConsecutiveVerificationRetries);
-        _sessionBreakers[sessionId] = loopBreaker;
-
-        string startPrompt = initialPrompt;
-        if (_memory != null && _memory.Count > 0)
+        int concurrentCount = _activeSessionLoops.AddOrUpdate(sessionId, 1, static (_, c) => c + 1);
+        if (concurrentCount == 1)
         {
-            var recalled = _memory.Query(initialPrompt, ReadOnlySpan<float>.Empty, maxTokens: _recallBudgetTokens);
-            if (!string.IsNullOrWhiteSpace(recalled.FormattedContext))
-            {
-                PublishEvent("MemoryRecalled", $"Traces: {recalled.SelectedTraces.Count}, Tokens: {recalled.TotalTokens}");
-                startPrompt = $"[EPISODIC MEMORY]\n{recalled.FormattedContext}\n\n[USER PROMPT]\n{initialPrompt}";
-            }
+            _sessionBreakers[sessionId] = loopBreaker;
         }
-
-        var promptBuilder = new StringBuilder(startPrompt);
-        AgentResponse lastResponse = new(string.Empty, true);
-
-        for (int step = 1; step <= maxSteps; step++)
+        else
         {
-            string currentPrompt = promptBuilder.ToString();
-            lastResponse = await ExecuteStepAsync(new AgentContext(sessionId, currentPrompt, step), ct).ConfigureAwait(false);
+            _sessionBreakers.TryAdd(sessionId, loopBreaker);
+        }
+        _currentLoopBreaker.Value = loopBreaker;
 
-            if (lastResponse.IsVerificationCircuitBreakerTripped && _verificationOptions.HaltOnCircuitBreaker)
+        try
+        {
+            string startPrompt = initialPrompt;
+            if (_memory != null && _memory.Count > 0)
             {
-                return lastResponse;
+                var recalled = await _memory.QueryAsync(initialPrompt, ReadOnlyMemory<float>.Empty, maxTokens: _recallBudgetTokens, cancellationToken: ct).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(recalled.FormattedContext))
+                {
+                    PublishEvent("MemoryRecalled", $"Traces: {recalled.SelectedTraces.Count}, Tokens: {recalled.TotalTokens}");
+                    startPrompt = $"[EPISODIC MEMORY]\n{recalled.FormattedContext}\n\n[USER PROMPT]\n{initialPrompt}";
+                }
             }
 
-            if (lastResponse.IsCompleted)
+            var promptBuilder = new StringBuilder(startPrompt);
+            AgentResponse lastResponse = new(string.Empty, true);
+
+            for (int step = 1; step <= maxSteps; step++)
             {
-                bool hasHooks = _verificationHooks.Count > 0;
-                IAgentTool? autoTool = null;
-                bool runAutoTool = !hasHooks
-                    && _verificationOptions.AutoInvokeRegisteredVerificationTool
-                    && lastResponse.VerificationStatus != VerificationStatus.Passed
-                    && TryFindAutoVerificationTool(out autoTool);
+                string currentPrompt = promptBuilder.ToString();
+                lastResponse = await ExecuteStepAsync(new AgentContext(sessionId, currentPrompt, step), ct).ConfigureAwait(false);
 
-                if (hasHooks || runAutoTool)
+                if (lastResponse.IsVerificationCircuitBreakerTripped && _verificationOptions.HaltOnCircuitBreaker)
                 {
-                    var (verResult, state) = await RunPostCompletionVerificationAsync(
-                        sessionId,
-                        initialPrompt,
-                        currentPrompt,
-                        lastResponse,
-                        step,
-                        autoTool,
-                        ct).ConfigureAwait(false);
+                    return lastResponse;
+                }
 
-                    if (verResult.Passed)
+                if (lastResponse.IsCompleted)
+                {
+                    bool hasHooks = _verificationHooks.Count > 0;
+                    IAgentTool? autoTool = null;
+                    bool runAutoTool = !hasHooks
+                        && _verificationOptions.AutoInvokeRegisteredVerificationTool
+                        && lastResponse.VerificationStatus != VerificationStatus.Passed
+                        && TryFindAutoVerificationTool(out autoTool);
+
+                    if (hasHooks || runAutoTool)
                     {
-                        _memory?.StoreTrace(new EpisodicTrace
+                        var (verResult, state) = await RunPostCompletionVerificationAsync(
+                            sessionId,
+                            initialPrompt,
+                            currentPrompt,
+                            lastResponse,
+                            step,
+                            autoTool,
+                            ct).ConfigureAwait(false);
+
+                        if (verResult.Passed)
                         {
-                            Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
-                            BaseImportance = 2.0f
-                        });
-                        return lastResponse with
+                            if (_memory != null)
+                            {
+                                await _memory.StoreTraceAsync(new EpisodicTrace
+                                {
+                                    Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
+                                    BaseImportance = 2.0f
+                                }, ct).ConfigureAwait(false);
+                            }
+                            return lastResponse with
+                            {
+                                VerificationStatus = VerificationStatus.Passed,
+                                VerificationResult = verResult
+                            };
+                        }
+
+                        if (state.IsTripped)
                         {
-                            VerificationStatus = VerificationStatus.Passed,
+                            if (_verificationOptions.ThrowOnCircuitBreakerTripped)
+                            {
+                                throw new VerificationCircuitBreakerException(state, verResult);
+                            }
+
+                            if (_verificationOptions.HaltOnCircuitBreaker)
+                            {
+                                return new AgentResponse(
+                                    Output: FormatCircuitBreakerOutput(verResult, state, lastResponse.Output),
+                                    IsCompleted: false,
+                                    ToolCallName: lastResponse.ToolCallName)
+                                {
+                                    VerificationStatus = VerificationStatus.CircuitBreakerTripped,
+                                    VerificationResult = verResult
+                                };
+                            }
+                        }
+
+                        if (step < maxSteps)
+                        {
+                            if (_verificationOptions.AppendStructuredFeedbackToPrompt)
+                            {
+                                AppendVerificationFailureFeedback(promptBuilder, step, verResult, state);
+                            }
+                            continue;
+                        }
+
+                        return new AgentResponse(
+                            Output: lastResponse.Output,
+                            IsCompleted: false,
+                            ToolCallName: lastResponse.ToolCallName)
+                        {
+                            VerificationStatus = state.IsTripped ? VerificationStatus.CircuitBreakerTripped : VerificationStatus.Failed,
                             VerificationResult = verResult
                         };
                     }
 
-                    if (state.IsTripped)
+                    if (_memory != null)
                     {
-                        if (_verificationOptions.ThrowOnCircuitBreakerTripped)
+                        await _memory.StoreTraceAsync(new EpisodicTrace
                         {
-                            throw new VerificationCircuitBreakerException(state, verResult);
-                        }
-
-                        if (_verificationOptions.HaltOnCircuitBreaker)
-                        {
-                            return new AgentResponse(
-                                Output: FormatCircuitBreakerOutput(verResult, state, lastResponse.Output),
-                                IsCompleted: false,
-                                ToolCallName: lastResponse.ToolCallName)
-                            {
-                                VerificationStatus = VerificationStatus.CircuitBreakerTripped,
-                                VerificationResult = verResult
-                            };
-                        }
+                            Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
+                            BaseImportance = 2.0f
+                        }, ct).ConfigureAwait(false);
                     }
+                    return lastResponse;
+                }
 
-                    if (step < maxSteps)
+                promptBuilder.Append('\n')
+                    .Append("<|tool_result|>{\"tool\":")
+                    .Append(JsonEncodeString(lastResponse.ToolCallName ?? string.Empty))
+                    .Append(",\"output\":")
+                    .Append(JsonEncodeString(lastResponse.Output))
+                    .Append('}');
+
+                if ((lastResponse.VerificationStatus == VerificationStatus.Failed || lastResponse.VerificationStatus == VerificationStatus.CircuitBreakerTripped)
+                    && _verificationOptions.AppendStructuredFeedbackToPrompt
+                    && lastResponse.VerificationResult != null)
+                {
+                    var breaker = GetOrCreateSessionBreaker(sessionId);
+                    AppendVerificationFailureFeedback(promptBuilder, step, lastResponse.VerificationResult, breaker.GetState());
+                }
+            }
+
+            var activeBreaker = _currentLoopBreaker.Value ?? GetCircuitBreaker(sessionId);
+            if (activeBreaker != null && activeBreaker.TotalFailures > 0 && activeBreaker.ConsecutiveFailures > 0)
+            {
+                return new AgentResponse(
+                    Output: lastResponse.Output,
+                    IsCompleted: false,
+                    ToolCallName: lastResponse.ToolCallName)
+                {
+                    VerificationStatus = activeBreaker.IsTripped ? VerificationStatus.CircuitBreakerTripped : VerificationStatus.Failed,
+                    VerificationResult = activeBreaker.LastResult
+                };
+            }
+
+            bool postHooksConfigured = _verificationHooks.Count > 0;
+            IAgentTool? postAutoTool = null;
+            bool postAutoToolConfigured = !postHooksConfigured
+                && _verificationOptions.AutoInvokeRegisteredVerificationTool
+                && lastResponse.VerificationStatus != VerificationStatus.Passed
+                && TryFindAutoVerificationTool(out postAutoTool);
+
+            if (postHooksConfigured || postAutoToolConfigured)
+            {
+                var (verResult, state) = await RunPostCompletionVerificationAsync(
+                    sessionId,
+                    initialPrompt,
+                    promptBuilder.ToString(),
+                    lastResponse,
+                    maxSteps,
+                    postAutoTool,
+                    ct).ConfigureAwait(false);
+
+                if (verResult.Passed)
+                {
+                    if (_memory != null)
                     {
-                        if (_verificationOptions.AppendStructuredFeedbackToPrompt)
+                        await _memory.StoreTraceAsync(new EpisodicTrace
                         {
-                            AppendVerificationFailureFeedback(promptBuilder, step, verResult, state);
-                        }
-                        continue;
+                            Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
+                            BaseImportance = 1.5f
+                        }, ct).ConfigureAwait(false);
                     }
-
-                    return new AgentResponse(
-                        Output: lastResponse.Output,
-                        IsCompleted: false,
-                        ToolCallName: lastResponse.ToolCallName)
+                    return lastResponse with
                     {
-                        VerificationStatus = state.IsTripped ? VerificationStatus.CircuitBreakerTripped : VerificationStatus.Failed,
+                        IsCompleted = true,
+                        VerificationStatus = VerificationStatus.Passed,
                         VerificationResult = verResult
                     };
                 }
 
-                _memory?.StoreTrace(new EpisodicTrace
+                if (state.IsTripped)
                 {
-                    Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
-                    BaseImportance = 2.0f
-                });
-                return lastResponse;
-            }
+                    if (_verificationOptions.ThrowOnCircuitBreakerTripped)
+                    {
+                        throw new VerificationCircuitBreakerException(state, verResult);
+                    }
 
-            promptBuilder.Append('\n')
-                .Append("<|tool_result|>{\"tool\":")
-                .Append(JsonEncodeString(lastResponse.ToolCallName ?? string.Empty))
-                .Append(",\"output\":")
-                .Append(JsonEncodeString(lastResponse.Output))
-                .Append('}');
+                    if (_verificationOptions.HaltOnCircuitBreaker)
+                    {
+                        return new AgentResponse(
+                            Output: FormatCircuitBreakerOutput(verResult, state, lastResponse.Output),
+                            IsCompleted: false,
+                            ToolCallName: lastResponse.ToolCallName)
+                        {
+                            VerificationStatus = VerificationStatus.CircuitBreakerTripped,
+                            VerificationResult = verResult
+                        };
+                    }
+                }
 
-            if ((lastResponse.VerificationStatus == VerificationStatus.Failed || lastResponse.VerificationStatus == VerificationStatus.CircuitBreakerTripped)
-                && _verificationOptions.AppendStructuredFeedbackToPrompt
-                && lastResponse.VerificationResult != null)
-            {
-                var breaker = GetOrCreateSessionBreaker(sessionId);
-                AppendVerificationFailureFeedback(promptBuilder, step, lastResponse.VerificationResult, breaker.GetState());
-            }
-        }
-
-        var activeBreaker = GetCircuitBreaker(sessionId);
-        if (activeBreaker != null && activeBreaker.TotalFailures > 0 && activeBreaker.ConsecutiveFailures > 0)
-        {
-            return new AgentResponse(
-                Output: lastResponse.Output,
-                IsCompleted: false,
-                ToolCallName: lastResponse.ToolCallName)
-            {
-                VerificationStatus = activeBreaker.IsTripped ? VerificationStatus.CircuitBreakerTripped : VerificationStatus.Failed,
-                VerificationResult = activeBreaker.LastResult
-            };
-        }
-
-        bool postHooksConfigured = _verificationHooks.Count > 0;
-        IAgentTool? postAutoTool = null;
-        bool postAutoToolConfigured = !postHooksConfigured
-            && _verificationOptions.AutoInvokeRegisteredVerificationTool
-            && lastResponse.VerificationStatus != VerificationStatus.Passed
-            && TryFindAutoVerificationTool(out postAutoTool);
-
-        if (postHooksConfigured || postAutoToolConfigured)
-        {
-            var (verResult, state) = await RunPostCompletionVerificationAsync(
-                sessionId,
-                initialPrompt,
-                promptBuilder.ToString(),
-                lastResponse,
-                maxSteps,
-                postAutoTool,
-                ct).ConfigureAwait(false);
-
-            if (verResult.Passed)
-            {
-                _memory?.StoreTrace(new EpisodicTrace
+                return new AgentResponse(
+                    Output: lastResponse.Output,
+                    IsCompleted: false,
+                    ToolCallName: lastResponse.ToolCallName)
                 {
-                    Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
-                    BaseImportance = 1.5f
-                });
-                return lastResponse with
-                {
-                    IsCompleted = true,
-                    VerificationStatus = VerificationStatus.Passed,
+                    VerificationStatus = state.IsTripped ? VerificationStatus.CircuitBreakerTripped : VerificationStatus.Failed,
                     VerificationResult = verResult
                 };
             }
 
-            if (state.IsTripped)
+            if (_memory != null)
             {
-                if (_verificationOptions.ThrowOnCircuitBreakerTripped)
+                await _memory.StoreTraceAsync(new EpisodicTrace
                 {
-                    throw new VerificationCircuitBreakerException(state, verResult);
-                }
-
-                if (_verificationOptions.HaltOnCircuitBreaker)
-                {
-                    return new AgentResponse(
-                        Output: FormatCircuitBreakerOutput(verResult, state, lastResponse.Output),
-                        IsCompleted: false,
-                        ToolCallName: lastResponse.ToolCallName)
-                    {
-                        VerificationStatus = VerificationStatus.CircuitBreakerTripped,
-                        VerificationResult = verResult
-                    };
-                }
+                    Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
+                    BaseImportance = 1.5f
+                }, ct).ConfigureAwait(false);
             }
-
-            return new AgentResponse(
-                Output: lastResponse.Output,
-                IsCompleted: false,
-                ToolCallName: lastResponse.ToolCallName)
-            {
-                VerificationStatus = state.IsTripped ? VerificationStatus.CircuitBreakerTripped : VerificationStatus.Failed,
-                VerificationResult = verResult
-            };
+            return new AgentResponse(lastResponse.Output, IsCompleted: true, lastResponse.ToolCallName);
         }
-
-        _memory?.StoreTrace(new EpisodicTrace
+        finally
         {
-            Content = $"Prompt: {initialPrompt}\nResult: {lastResponse.Output}",
-            BaseImportance = 1.5f
-        });
-        return new AgentResponse(lastResponse.Output, IsCompleted: true, lastResponse.ToolCallName);
+            _currentLoopBreaker.Value = null;
+            _activeSessionLoops.AddOrUpdate(sessionId, 0, static (_, c) => Math.Max(0, c - 1));
+        }
     }
 
     public async ValueTask<AgentResponse> ExecuteStepAsync(AgentContext context, CancellationToken ct = default)
@@ -758,7 +789,8 @@ public sealed class AgentExecutionEngine : IAgentRuntime
     }
 
     private VerificationCircuitBreaker GetOrCreateSessionBreaker(string sessionId)
-        => _sessionBreakers.GetOrAdd(sessionId, _ => new VerificationCircuitBreaker(_verificationOptions.MaxConsecutiveVerificationRetries));
+        => _currentLoopBreaker.Value
+           ?? _sessionBreakers.GetOrAdd(sessionId, _ => new VerificationCircuitBreaker(_verificationOptions.MaxConsecutiveVerificationRetries));
 
     private bool HasVerificationConfigured()
         => _verificationHooks.Count > 0
@@ -923,7 +955,9 @@ public sealed class AgentExecutionEngine : IAgentRuntime
         }
 
         // 2. Support structured JSON {"tool":"...","arguments":{...}} or {"name":"...","arguments":{...}}
-        if (trimmed.StartsWith('{') && trimmed.EndsWith('}') && TryParseJsonToolCall(trimmed, out var jsonDecision))
+        //    (including markdown ```json ... ``` fenced blocks)
+        string jsonCandidate = UnwrapMarkdownJsonFence(trimmed);
+        if (jsonCandidate.StartsWith('{') && jsonCandidate.EndsWith('}') && TryParseJsonToolCall(jsonCandidate, out var jsonDecision))
         {
             return jsonDecision;
         }
@@ -957,6 +991,26 @@ public sealed class AgentExecutionEngine : IAgentRuntime
 
         string output = isRawModelOutput ? trimmed : $"Processed prompt: {trimmed}";
         return new AgentStepDecision(output, IsCompleted: true);
+    }
+
+    private static string UnwrapMarkdownJsonFence(string trimmed)
+    {
+        if (!trimmed.StartsWith("```", StringComparison.Ordinal) || !trimmed.EndsWith("```", StringComparison.Ordinal))
+            return trimmed;
+
+        int firstNewline = trimmed.IndexOf('\n');
+        if (firstNewline < 0)
+            return trimmed;
+
+        string lang = trimmed[3..firstNewline].Trim();
+        if (lang.Length > 0 && !lang.Equals("json", StringComparison.OrdinalIgnoreCase))
+            return trimmed;
+
+        int closeIdx = trimmed.LastIndexOf("```", StringComparison.Ordinal);
+        if (closeIdx <= firstNewline)
+            return trimmed;
+
+        return trimmed[(firstNewline + 1)..closeIdx].Trim();
     }
 
     private static bool TryParseJsonToolCall(string json, out AgentStepDecision decision)

@@ -18,6 +18,8 @@ public class LlmRequest
     public LlmContent? SystemInstruction { get; set; }
     public List<LlmContent> Contents { get; set; } = new();
     public List<ITool> Tools { get; set; } = new();
+    public float? Temperature { get; set; }
+    public int? MaxTokens { get; set; }
 }
 
 public class LlmContent

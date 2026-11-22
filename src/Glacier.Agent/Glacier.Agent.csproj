@@ -12,7 +12,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <PackageId>Glacier.Agent</PackageId>
-    <Version>1.5.0</Version>
+    <Version>1.5.2</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 Autonomous Agent Runtime, compressed SIMD Radix Trie Tokenizer, Native AOT Branchless CLI, trained IVF-PQ / thread-safe HNSW Vector Index, and source-generated MCP Event Bus.</Description>
@@ -43,6 +43,6 @@
   </ItemGroup>
 
   <ItemGroup Condition="!Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.MemEx" Version="1.2.0" />
+    <PackageReference Include="Glacier.MemEx" Version="1.2.2" />
   </ItemGroup>
 </Project>
