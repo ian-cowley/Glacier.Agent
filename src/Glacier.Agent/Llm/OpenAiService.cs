@@ -627,6 +627,14 @@ public class OpenAiService : ILlmService, IDisposable
             payload["max_tokens"] = request.MaxTokens.Value;
         }
 
+        if (request.ReasoningEffort.HasValue)
+        {
+            payload["chat_template_kwargs"] = new JsonObject
+            {
+                ["reasoning_effort"] = request.ReasoningEffort.Value
+            };
+        }
+
         if (request.Tools.Count > 0)
         {
             var toolsArray = new JsonArray();

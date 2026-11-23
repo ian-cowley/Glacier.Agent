@@ -19,6 +19,8 @@ public class LlmAgent : IAgent
     public IApprovalService? ApprovalService { get; set; }
     public Func<ITool, string, Task<string>>? BeforeToolCall { get; set; }
     public int MaxRetries { get; set; } = 3;
+    public int MaxTurns { get; set; } = 0;
+    public int MaxIdenticalToolCalls { get; set; } = 0;
     public VerificationOptions? VerificationOptions { get; set; }
     public VerificationCircuitBreakerState? LastVerificationState { get; private set; }
     public VerificationResult? LastVerificationResult { get; private set; }
@@ -71,8 +73,16 @@ public class LlmAgent : IAgent
         LastVerificationResult = null;
         await SaveMessageAsync(sessionId, userMessage).ConfigureAwait(false);
 
+        int turnCount = 0;
+        var recentToolCalls = new List<string>();
         while (true)
         {
+            turnCount++;
+            if (MaxTurns > 0 && turnCount > MaxTurns)
+            {
+                return $"Stage '{Name}' reached MaxTurns={MaxTurns}. Handing off current progress to next stage.";
+            }
+
             var request = CreateRequest();
             await OnBeforeModelInvokeAsync(request).ConfigureAwait(false);
 
@@ -91,6 +101,22 @@ public class LlmAgent : IAgent
                     History.Add(feedback);
                     await SaveMessageAsync(sessionId, feedback).ConfigureAwait(false);
                     continue;
+                }
+
+                if (MaxIdenticalToolCalls > 0)
+                {
+                    string sig = string.Join("|", response.FunctionCalls.Select(c => $"{c.Name}:{c.Args?.ToJsonString() ?? "{}"}"));
+                    int identicalCount = recentToolCalls.TakeLast(4).Count(s => string.Equals(s, sig, StringComparison.Ordinal));
+                    recentToolCalls.Add(sig);
+                    if (identicalCount >= MaxIdenticalToolCalls)
+                    {
+                        var loopFeedback = LlmContent.User(
+                            $"System: LoopGuard blocked repeated identical tool call `{response.FunctionCalls[0].Name}`. " +
+                            "Do NOT repeat it. Switch strategy or conclude this stage with a plain-text summary.");
+                        History.Add(loopFeedback);
+                        await SaveMessageAsync(sessionId, loopFeedback).ConfigureAwait(false);
+                        continue;
+                    }
                 }
 
                 var (tripped, haltedOutput) = await HandleToolCallsAsync(response.FunctionCalls, sessionId, verificationBreaker).ConfigureAwait(false);

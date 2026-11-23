@@ -20,6 +20,7 @@ public class LlmRequest
     public List<ITool> Tools { get; set; } = new();
     public float? Temperature { get; set; }
     public int? MaxTokens { get; set; }
+    public float? ReasoningEffort { get; set; }
 }
 
 public class LlmContent
