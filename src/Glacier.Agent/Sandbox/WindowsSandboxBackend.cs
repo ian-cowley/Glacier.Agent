@@ -409,13 +409,41 @@ internal static class WindowsSandboxBackend
         }
     }
 
+    private const int MaxCapturedOutputChars = 4 * 1024 * 1024;
+
     private static Task<string> ReadPipeToEndAsync(SafeFileHandle readHandle)
     {
         return Task.Run(() =>
         {
             using var fs = new FileStream(readHandle, FileAccess.Read, 4096, isAsync: false);
             using var reader = new StreamReader(fs, Encoding.UTF8);
-            return reader.ReadToEnd();
+            var sb = new StringBuilder();
+            char[] buf = new char[4096];
+            bool truncated = false;
+            int read;
+            while ((read = reader.Read(buf, 0, buf.Length)) > 0)
+            {
+                if (!truncated)
+                {
+                    int remaining = MaxCapturedOutputChars - sb.Length;
+                    if (remaining <= 0)
+                    {
+                        sb.Append("\n[OUTPUT TRUNCATED]");
+                        truncated = true;
+                    }
+                    else if (read <= remaining)
+                    {
+                        sb.Append(buf, 0, read);
+                    }
+                    else
+                    {
+                        sb.Append(buf, 0, remaining);
+                        sb.Append("\n[OUTPUT TRUNCATED]");
+                        truncated = true;
+                    }
+                }
+            }
+            return sb.ToString();
         });
     }
 

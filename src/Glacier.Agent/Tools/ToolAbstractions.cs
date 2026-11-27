@@ -34,17 +34,23 @@ public class SensitiveTool : ITool
 
     public async Task<string> ExecuteAsync(string arguments)
     {
-        if (ApprovalService != null)
+        if (ApprovalService == null)
         {
-            var approved = await ApprovalService.ApproveAsync(Name, arguments).ConfigureAwait(false);
-            if (!approved)
+            return new JsonObject
             {
-                return new JsonObject
-                {
-                    ["status"] = "error",
-                    ["message"] = "Action rejected by user."
-                }.ToJsonString();
-            }
+                ["status"] = "error",
+                ["message"] = "Action rejected: no IApprovalService configured for SensitiveTool."
+            }.ToJsonString();
+        }
+
+        var approved = await ApprovalService.ApproveAsync(Name, arguments).ConfigureAwait(false);
+        if (!approved)
+        {
+            return new JsonObject
+            {
+                ["status"] = "error",
+                ["message"] = "Action rejected by user."
+            }.ToJsonString();
         }
 
         return await InnerTool.ExecuteAsync(arguments).ConfigureAwait(false);

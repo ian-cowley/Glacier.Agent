@@ -33,6 +33,11 @@ public class AdkToolTests
         Assert.Equal(42, result.Sum);
     }
 
+    private sealed class AutoApproveService : IApprovalService
+    {
+        public Task<bool> ApproveAsync(string toolName, string arguments) => Task.FromResult(true);
+    }
+
     [Fact]
     public async Task SensitiveTool_WrapsInnerToolCorrectly()
     {
@@ -41,7 +46,7 @@ public class AdkToolTests
             "Sensitive calculation",
             args => new CalcResult { Sum = args.A * args.B });
 
-        var sensitive = new SensitiveTool(inner);
+        var sensitive = new SensitiveTool(inner, new AutoApproveService());
 
         Assert.Equal("secure_action", sensitive.Name);
         Assert.Equal("Sensitive calculation", sensitive.Description);
@@ -52,6 +57,22 @@ public class AdkToolTests
         var result = JsonSerializer.Deserialize<CalcResult>(jsonResult, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         Assert.NotNull(result);
         Assert.Equal(42, result.Sum);
+    }
+
+    [Fact]
+    public async Task SensitiveTool_FailsClosed_WhenApprovalServiceIsNull()
+    {
+        bool invoked = false;
+        var inner = new FunctionTool<CalcArgs, CalcResult>(
+            "secure_action",
+            "Sensitive calculation",
+            args => { invoked = true; return new CalcResult { Sum = args.A * args.B }; });
+
+        var sensitive = new SensitiveTool(inner, approvalService: null);
+        string jsonResult = await sensitive.ExecuteAsync(JsonSerializer.Serialize(new CalcArgs { A = 6, B = 7 }));
+
+        Assert.False(invoked);
+        Assert.Contains("no IApprovalService", jsonResult, StringComparison.Ordinal);
     }
 
     [Fact]

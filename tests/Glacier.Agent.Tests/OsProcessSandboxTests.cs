@@ -340,4 +340,23 @@ public sealed class OsProcessSandboxTests
         Assert.Contains("no-namespaces", noNs.IsolationMechanism, StringComparison.Ordinal);
         Assert.DoesNotContain("PID=1\n", noNs.StandardOutput, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void LinuxSandboxPolicy_NamespaceIsolationMode_DefaultsToFailClosedUnlessOptInSet()
+    {
+        string? prior = Environment.GetEnvironmentVariable("GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK");
+        try
+        {
+            Environment.SetEnvironmentVariable("GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK", null);
+            Assert.Equal(0, LinuxSandboxPolicy.ResolveNativeNamespaceIsolationMode(false));
+            Assert.Equal(1, LinuxSandboxPolicy.ResolveNativeNamespaceIsolationMode(true));
+
+            Environment.SetEnvironmentVariable("GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK", "1");
+            Assert.Equal(2, LinuxSandboxPolicy.ResolveNativeNamespaceIsolationMode(true));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK", prior);
+        }
+    }
 }

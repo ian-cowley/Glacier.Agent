@@ -67,7 +67,7 @@ typedef struct glacier_sandbox_spawn_args {
     char* const* envp;
     const char* work_dir;
     int64_t memory_limit_bytes;
-    int32_t enable_namespace_isolation;
+    int32_t enable_namespace_isolation; /* 0 = disabled, 1 = strict fail-closed, 2 = explicit unisolated fallback on EPERM/EACCES */
     int32_t allow_network;
     int32_t has_memory_limit;
     int32_t has_max_processes;
@@ -456,6 +456,12 @@ int32_t glacier_sandbox_spawn(
 
         int clone_err = errno;
         if (clone_err == EPERM || clone_err == EACCES) {
+            if (args->enable_namespace_isolation != 2) {
+                out->err_no = clone_err;
+                out->mode = GLACIER_MODE_CLONE3_USERNS_DENIED;
+                return -1;
+            }
+
             pidfd = -1;
             glacier_clone_args_t plain_args;
             __builtin_memset(&plain_args, 0, sizeof(plain_args));

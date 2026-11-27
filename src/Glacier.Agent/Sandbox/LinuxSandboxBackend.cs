@@ -13,6 +13,25 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+internal static class LinuxSandboxPolicy
+{
+    internal static bool AllowUnisolatedNamespaceFallback()
+    {
+        string? raw = Environment.GetEnvironmentVariable("GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK");
+        return string.Equals(raw, "1", StringComparison.Ordinal) ||
+               string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static int ResolveNativeNamespaceIsolationMode(bool enableNamespaceIsolation)
+    {
+        if (!enableNamespaceIsolation)
+        {
+            return 0;
+        }
+        return AllowUnisolatedNamespaceFallback() ? 2 : 1;
+    }
+}
+
 [SupportedOSPlatform("linux")]
 internal static unsafe class LinuxSandboxBackend
 {
@@ -217,7 +236,7 @@ internal static unsafe class LinuxSandboxBackend
                     Envp = envpPtr,
                     WorkDir = workDirPtr,
                     MemoryLimitBytes = options.MemoryLimitBytes.GetValueOrDefault(),
-                    EnableNamespaceIsolation = options.EnableNamespaceIsolation ? 1 : 0,
+                    EnableNamespaceIsolation = LinuxSandboxPolicy.ResolveNativeNamespaceIsolationMode(options.EnableNamespaceIsolation),
                     AllowNetwork = options.AllowNetwork ? 1 : 0,
                     HasMemoryLimit = options.MemoryLimitBytes.HasValue ? 1 : 0,
                     HasMaxProcesses = options.MaxProcesses.HasValue ? 1 : 0,
@@ -897,6 +916,12 @@ internal static unsafe class LinuxSandboxBackend
 
             if (cloneErr == LinuxNativeMethods.EPERM || cloneErr == LinuxNativeMethods.EACCES)
             {
+                if (!LinuxSandboxPolicy.AllowUnisolatedNamespaceFallback())
+                {
+                    throw new PlatformNotSupportedException(
+                        $"Linux user/mount namespace isolation was denied (errno={cloneErr}). Set GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK=1 to permit unisolated fallback.");
+                }
+
                 localPidfd = -1;
                 var plainArgs = new LinuxNativeMethods.CloneArgs
                 {
