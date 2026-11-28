@@ -12,7 +12,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <PackageId>Glacier.Agent</PackageId>
-    <Version>1.5.3</Version>
+    <Version>1.5.4</Version>
     <PackageReleaseNotes>v1.5.3: Fail-closed Linux namespace isolation policy and aligned Clavier 1.2.1 / MemEx 1.2.3 dependencies.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>

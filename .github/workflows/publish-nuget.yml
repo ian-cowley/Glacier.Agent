@@ -44,6 +44,8 @@ jobs:
         run: dotnet build --configuration Release --no-restore
 
       - name: Run tests
+        env:
+          GLACIER_SANDBOX_ALLOW_UNISOLATED_FALLBACK: '1'
         run: dotnet test tests/Glacier.Agent.Tests/Glacier.Agent.Tests.csproj --configuration Release --no-restore --no-build --blame-hang --blame-hang-dump-type none --blame-hang-timeout 60s
 
       - name: Pack Glacier.Agent
