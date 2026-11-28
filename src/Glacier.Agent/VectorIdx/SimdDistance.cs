@@ -166,22 +166,102 @@ public static class SimdDistance
     }
 
     /// <summary>
-    /// Computes Cosine Distance: 1.0 - (dot(a, b) / (||a|| * ||b||)).
+    /// Computes Cosine Distance: 1.0 - (dot(a, b) / (||a|| * ||b||)) in a single fused pass.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static float CosineDistance(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
-        float dot = DotProduct(a, b);
-        float normA = DotProduct(a, a);
-        float normB = DotProduct(b, b);
+        int length = Math.Min(a.Length, b.Length);
+        int i = 0;
+        float dot = 0f;
+        float normA = 0f;
+        float normB = 0f;
+
+        ref float pA = ref MemoryMarshal.GetReference(a);
+        ref float pB = ref MemoryMarshal.GetReference(b);
+
+        if (Vector512.IsHardwareAccelerated && length >= Vector512<float>.Count)
+        {
+            Vector512<float> accDot = Vector512<float>.Zero;
+            Vector512<float> accA = Vector512<float>.Zero;
+            Vector512<float> accB = Vector512<float>.Zero;
+            int limit = length - Vector512<float>.Count;
+            while (i <= limit)
+            {
+                Vector512<float> va = Vector512.LoadUnsafe(ref pA, (nuint)i);
+                Vector512<float> vb = Vector512.LoadUnsafe(ref pB, (nuint)i);
+                accDot = Vector512.MultiplyAddEstimate(va, vb, accDot);
+                accA = Vector512.MultiplyAddEstimate(va, va, accA);
+                accB = Vector512.MultiplyAddEstimate(vb, vb, accB);
+                i += Vector512<float>.Count;
+            }
+            dot += Vector512.Sum(accDot);
+            normA += Vector512.Sum(accA);
+            normB += Vector512.Sum(accB);
+        }
+
+        if (Vector256.IsHardwareAccelerated && (length - i) >= Vector256<float>.Count)
+        {
+            Vector256<float> accDot = Vector256<float>.Zero;
+            Vector256<float> accA = Vector256<float>.Zero;
+            Vector256<float> accB = Vector256<float>.Zero;
+            int limit = length - Vector256<float>.Count;
+            while (i <= limit)
+            {
+                Vector256<float> va = Vector256.LoadUnsafe(ref pA, (nuint)i);
+                Vector256<float> vb = Vector256.LoadUnsafe(ref pB, (nuint)i);
+                accDot = Vector256.MultiplyAddEstimate(va, vb, accDot);
+                accA = Vector256.MultiplyAddEstimate(va, va, accA);
+                accB = Vector256.MultiplyAddEstimate(vb, vb, accB);
+                i += Vector256<float>.Count;
+            }
+            dot += Vector256.Sum(accDot);
+            normA += Vector256.Sum(accA);
+            normB += Vector256.Sum(accB);
+        }
+
+        if (Vector128.IsHardwareAccelerated && (length - i) >= Vector128<float>.Count)
+        {
+            Vector128<float> accDot = Vector128<float>.Zero;
+            Vector128<float> accA = Vector128<float>.Zero;
+            Vector128<float> accB = Vector128<float>.Zero;
+            int limit = length - Vector128<float>.Count;
+            while (i <= limit)
+            {
+                Vector128<float> va = Vector128.LoadUnsafe(ref pA, (nuint)i);
+                Vector128<float> vb = Vector128.LoadUnsafe(ref pB, (nuint)i);
+                accDot = Vector128.MultiplyAddEstimate(va, vb, accDot);
+                accA = Vector128.MultiplyAddEstimate(va, va, accA);
+                accB = Vector128.MultiplyAddEstimate(vb, vb, accB);
+                i += Vector128<float>.Count;
+            }
+            dot += Vector128.Sum(accDot);
+            normA += Vector128.Sum(accA);
+            normB += Vector128.Sum(accB);
+        }
+
+        while (i < length)
+        {
+            float va = Unsafe.Add(ref pA, i);
+            float vb = Unsafe.Add(ref pB, i);
+            dot += va * vb;
+            normA += va * va;
+            normB += vb * vb;
+            i++;
+        }
 
         if (normA <= 0f || normB <= 0f)
         {
             return 1.0f;
         }
 
-        float denom = MathF.Sqrt(normA * normB);
-        float sim = dot / denom;
+        double denom = Math.Sqrt((double)normA * (double)normB);
+        if (denom <= 0.0 || double.IsNaN(denom))
+        {
+            return 1.0f;
+        }
+
+        float sim = (float)((double)dot / denom);
         sim = Math.Clamp(sim, -1.0f, 1.0f);
         return 1.0f - sim;
     }

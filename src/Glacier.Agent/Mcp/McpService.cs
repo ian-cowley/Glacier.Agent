@@ -86,7 +86,7 @@ public class McpService : IAsyncDisposable
 
                 var transport = new StreamMcpTransport(process.StandardOutput.BaseStream, process.StandardInput.BaseStream);
                 var client = new McpClient(transport);
-                await client.InitializeAsync("AgentDevKit.Adk", SdkVersion).ConfigureAwait(false);
+                await client.InitializeAsync("Glacier.Agent", SdkVersion).ConfigureAwait(false);
 
                 _clients.Add(client);
 
@@ -170,8 +170,9 @@ public class McpService : IAsyncDisposable
             {
                 await client.DisposeAsync().ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                _logger?.LogDebug(ex, "Error disposing MCP client.");
             }
         }
         _clients.Clear();
@@ -186,7 +187,10 @@ public class McpService : IAsyncDisposable
                 }
                 process.Dispose();
             }
-            catch
+            catch (InvalidOperationException)
+            {
+            }
+            catch (System.ComponentModel.Win32Exception)
             {
             }
         }

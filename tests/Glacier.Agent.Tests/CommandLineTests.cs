@@ -101,4 +101,117 @@ public sealed class CommandLineTests
         Assert.Equal(0, verResult);
         Assert.Contains("2.5.0", swOut2.ToString());
     }
+
+    [Fact]
+    public void NegativeNumericOptions_AndShortOptionEquals_AndCaseInsensitiveRequired_ParseCorrectly()
+    {
+        double capturedTemp = 0;
+        int capturedPort = 0;
+        var err = new StringWriter();
+        var app = new CliApp("glacier") { Error = err };
+
+        app.AddCommand(new CliCommand("infer")
+            .AddOption("--temp", "-t", "Sampling temperature", hasValue: true, isRequired: true)
+            .AddOption("--port", "-p", "Listen port", hasValue: true, defaultValue: "8080")
+            .SetHandler(ctx =>
+            {
+                capturedTemp = ctx.GetOptionDouble("--temp");
+                capturedPort = ctx.GetOptionInt("--port");
+                return 0;
+            }));
+
+        Assert.Equal(0, app.Run(["infer", "--TEMP", "-0.5", "-p=9090"]));
+        Assert.Equal(-0.5, capturedTemp, precision: 5);
+        Assert.Equal(9090, capturedPort);
+
+        Assert.Equal(0, app.Run(["infer", "-t", "-0.25"]));
+        Assert.Equal(-0.25, capturedTemp, precision: 5);
+        Assert.Equal(8080, capturedPort);
+
+        Assert.Equal(0, app.Run(["infer", "-t", "-.75"]));
+        Assert.Equal(-0.75, capturedTemp, precision: 5);
+    }
+
+    [Fact]
+    public void Flag_ShortAndLongCrossLookup_AndCombinedAndUnregisteredFlags_ParseCorrectly()
+    {
+        bool hasVerboseLong = false;
+        bool hasVerboseShort = false;
+        bool hasVerboseBare = false;
+        bool hasAlphaLong = false;
+        bool hasAlphaShort = false;
+        bool hasBetaLong = false;
+        bool hasBetaShort = false;
+        bool hasCustom = false;
+        bool hasUnregShort = false;
+        bool hasMissing = false;
+
+        var app = new CliApp("glacier");
+        app.AddCommand(new CliCommand("cmd")
+            .AddFlag("--verbose", "-v", "Verbose")
+            .AddFlag("--alpha", "-a", "Alpha")
+            .AddFlag("--beta", "-b", "Beta")
+            .SetHandler(ctx =>
+            {
+                hasVerboseLong = ctx.HasFlag("--verbose");
+                hasVerboseShort = ctx.HasFlag("-v");
+                hasVerboseBare = ctx.HasFlag("verbose");
+                hasAlphaLong = ctx.HasFlag("--alpha");
+                hasAlphaShort = ctx.HasFlag("-a");
+                hasBetaLong = ctx.HasFlag("--beta");
+                hasBetaShort = ctx.HasFlag("-b");
+                hasCustom = ctx.HasFlag("--custom");
+                hasUnregShort = ctx.HasFlag("-z");
+                hasMissing = ctx.HasFlag("--missing");
+                return 0;
+            }));
+
+        Assert.Equal(0, app.Run(["cmd", "-v"]));
+        Assert.True(hasVerboseLong);
+        Assert.True(hasVerboseShort);
+        Assert.True(hasVerboseBare);
+
+        Assert.Equal(0, app.Run(["cmd", "--verbose", "-ab", "--custom", "-z"]));
+        Assert.True(hasVerboseLong);
+        Assert.True(hasVerboseShort);
+        Assert.True(hasAlphaLong);
+        Assert.True(hasAlphaShort);
+        Assert.True(hasBetaLong);
+        Assert.True(hasBetaShort);
+        Assert.True(hasCustom);
+        Assert.True(hasUnregShort);
+        Assert.False(hasMissing);
+    }
+
+    [Fact]
+    public void MissingValueBeforeFlag_WithDefault_PreservesDefaultAndParsesFlag()
+    {
+        double capturedTemp = 0;
+        bool hasVerboseLong = false;
+        bool hasVerboseShort = false;
+        var err = new StringWriter();
+        var app = new CliApp("glacier") { Error = err };
+
+        app.AddCommand(new CliCommand("cmd")
+            .AddOption("--temp", "-t", "Sampling temperature", hasValue: true, defaultValue: "1.0")
+            .AddFlag("--verbose", "-v", "Verbose")
+            .SetHandler(ctx =>
+            {
+                capturedTemp = ctx.GetOptionDouble("--temp");
+                hasVerboseLong = ctx.HasFlag("--verbose");
+                hasVerboseShort = ctx.HasFlag("-v");
+                return 0;
+            }));
+
+        Assert.Equal(0, app.Run(["cmd", "--temp", "--verbose"]));
+        Assert.Equal(1.0, capturedTemp, precision: 5);
+        Assert.True(hasVerboseLong);
+        Assert.True(hasVerboseShort);
+        Assert.Equal(string.Empty, err.ToString());
+
+        Assert.Equal(0, app.Run(["cmd", "-t", "-v"]));
+        Assert.Equal(1.0, capturedTemp, precision: 5);
+        Assert.True(hasVerboseLong);
+        Assert.True(hasVerboseShort);
+    }
 }

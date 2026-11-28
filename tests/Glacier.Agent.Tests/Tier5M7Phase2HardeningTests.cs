@@ -279,7 +279,7 @@ public sealed class Tier5M7Phase2HardeningTests
     }
 
     [Fact]
-    public void AgentExecutionEngine_ConcurrentLoopsSameSessionId_AndAsyncMemory_NoRaceOrDeadlock()
+    public async Task AgentExecutionEngine_ConcurrentLoopsSameSessionId_AndAsyncMemory_NoRaceOrDeadlock()
     {
         using var handler = new TrackingHandler(async (_, ct) =>
         {
@@ -321,7 +321,7 @@ public sealed class Tier5M7Phase2HardeningTests
             }
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
-        driver.Wait();
+        await driver;
         Assert.Null(failure);
     }
 }

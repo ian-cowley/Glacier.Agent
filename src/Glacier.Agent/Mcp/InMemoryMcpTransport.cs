@@ -79,21 +79,27 @@ public sealed class InMemoryMcpTransport : IMcpTransport
 
     public ValueTask CloseAsync()
     {
+        CloseCore();
+        return ValueTask.CompletedTask;
+    }
+
+    private void CloseCore()
+    {
         if (!_isDisposed)
         {
             _isDisposed = true;
             _onClose();
         }
-        return ValueTask.CompletedTask;
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        await CloseAsync().ConfigureAwait(false);
+        CloseCore();
+        return ValueTask.CompletedTask;
     }
 
     public void Dispose()
     {
-        CloseAsync().GetAwaiter().GetResult();
+        CloseCore();
     }
 }

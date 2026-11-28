@@ -115,4 +115,34 @@ public sealed class TokenizerTests
 
         Assert.True(tokensPerSec > 100_000, $"Expected throughput >100k tokens/s on shared CI runner, got {tokensPerSec:N0} tokens/s");
     }
+
+    [Fact]
+    public void FindChildVector128_MatchesFindChildScalar_AcrossAllNodes()
+    {
+        var builder = new SimdRadixTrieBuilder();
+        builder.AddDefaultVocabulary();
+        for (int i = 0; i < 45; i++)
+        {
+            char first = (char)(33 + i);
+            builder.AddToken($" {first}longtoken_{i}");
+        }
+        var tokenizer = builder.Build();
+
+        for (int rootByte = 0; rootByte < 256; rootByte++)
+        {
+            int nodeIdx = tokenizer.GetRootNodeIndex((byte)rootByte);
+            if (nodeIdx < 0) continue;
+
+            int edgeCount = tokenizer.GetNodeEdgeCount(nodeIdx);
+            if (edgeCount == 0) continue;
+
+            int simdCount = edgeCount > 32 ? 32 : edgeCount;
+            for (int probe = 0; probe < 256; probe++)
+            {
+                int vec128 = tokenizer.FindChildVector128(nodeIdx, (byte)probe, simdCount);
+                int scalar = tokenizer.FindChildScalar(nodeIdx, (byte)probe, simdCount);
+                Assert.Equal(scalar, vec128);
+            }
+        }
+    }
 }

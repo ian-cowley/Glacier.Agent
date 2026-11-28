@@ -2,6 +2,9 @@ namespace Glacier.Agent.Tests;
 
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Agent.Mcp;
 using Glacier.Agent.Runtime;
@@ -81,5 +84,93 @@ public sealed class McpTests
 
         var response = await engine.ExecuteStepAsync(new AgentContext("sess-1", "CALL get_weather: {}", 1));
         Assert.Equal("Sunny in Seattle", response.Output);
+    }
+
+    [Fact]
+    public async Task McpClient_CallToolAsync_RejectsMalformedJsonAndCleansPendingOnSendFailure()
+    {
+        var (clientTransport, serverTransport) = InMemoryMcpTransport.CreateConnectedPair();
+        await using var server = new McpServer(serverTransport);
+        await using var client = new McpClient(clientTransport);
+
+        server.RegisterTool(new McpTool("echo", "Echo"), (args, _) => ValueTask.FromResult(McpToolCallResult.Success(args)));
+        server.Start();
+        client.Start();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => client.CallToolAsync("echo", "{malformed json").AsTask());
+
+        // Verify client still operates after invalid argument rejection
+        var validResult = await client.CallToolAsync("echo", "{\"k\":1}");
+        Assert.False(validResult.IsError);
+        Assert.Contains("\"k\":1", validResult.Content[0].Text, StringComparison.Ordinal);
+
+        await using var failingClient = new McpClient(new FailingSendTransport());
+        await Assert.ThrowsAsync<IOException>(() => failingClient.CallToolAsync("echo", "{}").AsTask());
+    }
+
+    [Fact]
+    public async Task McpServer_RegisterAgentTool_UsesJsonElementDefaultAndRejectsInvalidSchema()
+    {
+        var (clientTransport, serverTransport) = InMemoryMcpTransport.CreateConnectedPair();
+        await using var server = new McpServer(serverTransport);
+        await using var client = new McpClient(clientTransport);
+
+        server.RegisterTool(new StubAgentTool("empty_schema_tool", ""));
+        Assert.Throws<ArgumentException>(() => server.RegisterTool(new StubAgentTool("bad_schema_tool", "{not valid json")));
+
+        server.Start();
+        client.Start();
+
+        var tools = await client.ListToolsAsync();
+        McpTool listed = Assert.Single(tools);
+        Assert.IsType<JsonElement>(listed.InputSchema);
+        Assert.Equal("""{"type":"object"}""", listed.GetInputSchemaJson());
+    }
+
+    [Fact]
+    public async Task McpServer_HandlesConcurrentBurstThroughBoundedChannel()
+    {
+        var (clientTransport, serverTransport) = InMemoryMcpTransport.CreateConnectedPair();
+        await using var server = new McpServer(serverTransport);
+        await using var client = new McpClient(clientTransport);
+
+        server.RegisterTool(new McpTool("add_one", "Echo"), (args, _) => ValueTask.FromResult(McpToolCallResult.Success(args)));
+        server.Start();
+        client.Start();
+
+        var tasks = new List<Task<McpToolCallResult>>(30);
+        for (int i = 0; i < 30; i++)
+        {
+            tasks.Add(client.CallToolAsync("add_one", $"{{\"i\":{i}}}").AsTask());
+        }
+
+        McpToolCallResult[] results = await Task.WhenAll(tasks);
+        Assert.Equal(30, results.Length);
+        Assert.All(results, r => Assert.False(r.IsError));
+    }
+
+    private sealed class StubAgentTool(string name, string schema) : IAgentTool
+    {
+        public string Name => name;
+        public string Description => "Stub";
+        public string ParameterJsonSchema => schema;
+        public ValueTask<string> ExecuteAsync(string argumentsJson, CancellationToken ct = default)
+            => ValueTask.FromResult(argumentsJson);
+    }
+
+    private sealed class FailingSendTransport : IMcpTransport
+    {
+        public ValueTask SendMessageAsync(string messageJson, CancellationToken ct = default)
+            => ValueTask.FromException(new IOException("Simulated transport failure"));
+
+        public async IAsyncEnumerable<string> ReadMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            yield break;
+        }
+
+        public ValueTask CloseAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public void Dispose() { }
     }
 }

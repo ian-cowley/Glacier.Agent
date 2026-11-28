@@ -35,19 +35,24 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.0" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
-    <PackageReference Include="OpenTelemetry" Version="1.15.3" />
-    <PackageReference Include="Glacier.Clavier" Version="1.2.1" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" />
+    <PackageReference Include="OpenTelemetry" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('../../../Glacier.Clavier/src/Glacier.Clavier/Glacier.Clavier.csproj') and '$(UseLocalProjectReferences)' != 'false'">
+    <ProjectReference Include="../../../Glacier.Clavier/src/Glacier.Clavier/Glacier.Clavier.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('../../../Glacier.Clavier/src/Glacier.Clavier/Glacier.Clavier.csproj') or '$(UseLocalProjectReferences)' == 'false'">
+    <PackageReference Include="Glacier.Clavier" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj') and '$(UseLocalProjectReferences)' != 'false'">
     <ProjectReference Include="../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj" />
   </ItemGroup>
-
   <ItemGroup Condition="!Exists('../../../Glacier.MemEx/src/Glacier.MemEx/Glacier.MemEx.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.MemEx" Version="1.2.3" />
+    <PackageReference Include="Glacier.MemEx" />
   </ItemGroup>
 </Project>

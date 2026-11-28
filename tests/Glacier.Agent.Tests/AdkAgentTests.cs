@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json.Nodes;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Agent;
 using Glacier.Agent.Workflows;
@@ -132,5 +133,84 @@ public class AdkAgentTests
     public class WeatherArgs
     {
         public string City { get; set; } = string.Empty;
+    }
+
+    [Fact]
+    public async Task LlmAgent_RunStreamingAsync_EnforcesMaxTurnsAndCancellation()
+    {
+        int calls = 0;
+        var endlessLlm = new TestLlmService(_ =>
+        {
+            calls++;
+            return new LlmResponse
+            {
+                FunctionCalls =
+                [
+                    new LlmFunctionCall { Name = "get_weather", Args = JsonNode.Parse("{\"city\":\"Seattle\"}") }
+                ]
+            };
+        });
+
+        var tool = new FunctionTool<WeatherArgs, string>("get_weather", "Gets weather", args => $"Sunny in {args.City}");
+        var agent = new LlmAgent("StreamBot", "test-model", "desc", "inst", [tool])
+        {
+            MaxTurns = 2
+        };
+
+        var chunks = new List<string>();
+        await foreach (string chunk in agent.RunStreamingAsync("Loop", endlessLlm))
+        {
+            chunks.Add(chunk);
+        }
+
+        Assert.Equal(2, calls);
+        Assert.Contains(chunks, c => c.Contains("MaxTurns=2", StringComparison.Ordinal));
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (string _ in agent.RunStreamingAsync("Cancel me", endlessLlm).WithCancellation(cts.Token))
+            {
+            }
+        });
+    }
+
+    [Fact]
+    public async Task LlmAgent_RunStreamingAsync_EnforcesMaxIdenticalToolCalls()
+    {
+        int calls = 0;
+        var loopLlm = new TestLlmService(req =>
+        {
+            calls++;
+            if (req.Contents.Any(c => c.Parts.Any(p => p.Text?.Contains("LoopGuard blocked", StringComparison.Ordinal) == true)))
+            {
+                return new LlmResponse { Content = "Switched strategy cleanly." };
+            }
+
+            return new LlmResponse
+            {
+                FunctionCalls =
+                [
+                    new LlmFunctionCall { Name = "get_weather", Args = JsonNode.Parse("{\"city\":\"Seattle\"}") }
+                ]
+            };
+        });
+
+        var tool = new FunctionTool<WeatherArgs, string>("get_weather", "Gets weather", args => $"Sunny in {args.City}");
+        var agent = new LlmAgent("LoopGuardStreamBot", "test-model", "desc", "inst", [tool])
+        {
+            MaxIdenticalToolCalls = 2,
+            MaxTurns = 6
+        };
+
+        var chunks = new List<string>();
+        await foreach (string chunk in agent.RunStreamingAsync("Start", loopLlm))
+        {
+            chunks.Add(chunk);
+        }
+
+        Assert.Equal(4, calls);
+        Assert.Equal("Switched strategy cleanly.", string.Concat(chunks));
     }
 }

@@ -126,9 +126,11 @@ public sealed class CliApp
                 int eqIdx = span.IndexOf('=');
                 if (eqIdx > 0)
                 {
+                    ReadOnlySpan<char> keySpan = span.Slice(0, eqIdx);
                     string key = current.Substring(0, eqIdx);
                     string val = current.Substring(eqIdx + 1);
-                    context.AddOption(key, val);
+                    CliOption? opt = FindOption(activeCommand, keySpan);
+                    context.AddOption(opt?.Name ?? key, val);
                 }
                 else
                 {
@@ -136,13 +138,13 @@ public sealed class CliApp
                     CliOption? opt = FindOption(activeCommand, span);
                     if (opt != null && opt.HasValue)
                     {
-                        if (i + 1 < args.Length && !args[i + 1].StartsWith('-'))
+                        if (i + 1 < args.Length && (!args[i + 1].StartsWith('-') || IsNegativeNumber(args[i + 1])))
                         {
-                            context.AddOption(current, args[++i]);
+                            context.AddOption(opt.Name, args[++i]);
                         }
                         else if (opt.DefaultValue != null)
                         {
-                            context.AddOption(current, opt.DefaultValue);
+                            context.AddOption(opt.Name, opt.DefaultValue);
                         }
                         else
                         {
@@ -153,43 +155,57 @@ public sealed class CliApp
                     else
                     {
                         // Boolean flag
-                        context.AddFlag(current);
+                        AddFlagForOption(context, opt, current);
                     }
                 }
             }
-            else if (span.StartsWith('-') && span.Length > 1 && !char.IsDigit(span[1]))
+            else if (span.StartsWith('-') && span.Length > 1 && !IsNegativeNumber(span))
             {
-                // Short option or short flag (e.g. -p or -v)
-                CliOption? opt = FindOption(activeCommand, span);
-                if (opt != null && opt.HasValue)
+                // Short option or short flag (e.g. -p, -p=8080, or -v)
+                int eqIdx = span.IndexOf('=');
+                if (eqIdx > 1)
                 {
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith('-'))
-                    {
-                        context.AddOption(opt.Name, args[++i]);
-                    }
-                    else if (opt.DefaultValue != null)
-                    {
-                        context.AddOption(opt.Name, opt.DefaultValue);
-                    }
-                    else
-                    {
-                        Error.WriteLine($"Error: Option '{current}' expects a value.");
-                        return 1;
-                    }
+                    ReadOnlySpan<char> keySpan = span.Slice(0, eqIdx);
+                    string key = current.Substring(0, eqIdx);
+                    string val = current.Substring(eqIdx + 1);
+                    CliOption? eqOpt = FindOption(activeCommand, keySpan);
+                    context.AddOption(eqOpt?.Name ?? key, val);
                 }
                 else
                 {
-                    // Short flag: could be combined flags e.g. -xyz
-                    if (span.Length > 2 && opt == null)
+                    CliOption? opt = FindOption(activeCommand, span);
+                    if (opt != null && opt.HasValue)
                     {
-                        for (int c = 1; c < span.Length; c++)
+                        if (i + 1 < args.Length && (!args[i + 1].StartsWith('-') || IsNegativeNumber(args[i + 1])))
                         {
-                            context.AddFlag("-" + span[c]);
+                            context.AddOption(opt.Name, args[++i]);
+                        }
+                        else if (opt.DefaultValue != null)
+                        {
+                            context.AddOption(opt.Name, opt.DefaultValue);
+                        }
+                        else
+                        {
+                            Error.WriteLine($"Error: Option '{current}' expects a value.");
+                            return 1;
                         }
                     }
                     else
                     {
-                        context.AddFlag(current);
+                        // Short flag: could be combined flags e.g. -xyz
+                        if (span.Length > 2 && opt == null)
+                        {
+                            for (int c = 1; c < span.Length; c++)
+                            {
+                                string shortFlag = "-" + span[c];
+                                CliOption? subOpt = FindOption(activeCommand, shortFlag.AsSpan());
+                                AddFlagForOption(context, subOpt, shortFlag);
+                            }
+                        }
+                        else
+                        {
+                            AddFlagForOption(context, opt, current);
+                        }
                     }
                 }
             }
@@ -237,6 +253,27 @@ public sealed class CliApp
 
         PrintHelp(activeCommand);
         return 0;
+    }
+
+    private static void AddFlagForOption(CliContext context, CliOption? opt, string rawFlag)
+    {
+        if (opt != null)
+        {
+            context.AddFlag(opt.Name);
+            if (!string.IsNullOrEmpty(opt.ShortName))
+            {
+                context.AddFlag(opt.ShortName);
+            }
+        }
+        else
+        {
+            context.AddFlag(rawFlag);
+        }
+    }
+
+    private static bool IsNegativeNumber(ReadOnlySpan<char> s)
+    {
+        return s.Length >= 2 && s[0] == '-' && (char.IsAsciiDigit(s[1]) || (s[1] == '.' && s.Length >= 3 && char.IsAsciiDigit(s[2])));
     }
 
     private static CliOption? FindOption(CliCommand command, ReadOnlySpan<char> span)

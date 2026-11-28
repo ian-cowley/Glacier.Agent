@@ -27,6 +27,14 @@ public sealed record McpTool(
     string Description,
     object? InputSchema = null)
 {
+    internal static readonly JsonElement DefaultInputSchemaElement = CreateDefaultSchemaElement();
+
+    private static JsonElement CreateDefaultSchemaElement()
+    {
+        using var doc = JsonDocument.Parse("""{"type":"object"}""");
+        return doc.RootElement.Clone();
+    }
+
     public string GetInputSchemaJson()
     {
         if (InputSchema is JsonElement je && je.ValueKind != JsonValueKind.Undefined)
@@ -59,7 +67,7 @@ public sealed record McpTool(
                 using var doc = JsonDocument.Parse(s);
                 doc.RootElement.WriteTo(writer);
             }
-            catch
+            catch (JsonException)
             {
                 writer.WriteStartObject();
                 writer.WriteString("type", "object");

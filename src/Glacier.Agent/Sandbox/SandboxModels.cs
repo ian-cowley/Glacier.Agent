@@ -48,12 +48,13 @@ public sealed class SandboxOptions
     public long? MemoryLimitBytes { get; init; }
 
     /// <summary>
-    /// Optional environment variable overrides merged onto the inherited environment.
+    /// Optional environment variable overrides merged onto the safe non-secret OS environment allowlist.
+    /// Host secrets (such as API keys or credentials) are not inherited unless explicitly provided here.
     /// </summary>
     public IReadOnlyDictionary<string, string>? EnvironmentVariables { get; init; }
 
     /// <summary>
-    /// When <see langword="false"/> (default), isolates network access via <c>CLONE_NEWNET</c> on Linux.
+    /// When <see langword="false"/> (default), isolates network access via AppContainer on Windows and <c>CLONE_NEWNET</c> on Linux.
     /// </summary>
     public bool AllowNetwork { get; init; } = false;
 
@@ -71,6 +72,16 @@ public sealed class SandboxOptions
     /// Optional UTF-8 text fed to standard input of the sandboxed process.
     /// </summary>
     public string? StandardInput { get; init; }
+
+    /// <summary>
+    /// Optional host directories or files granted temporary read-only access inside the sandbox (e.g., Windows AppContainer).
+    /// </summary>
+    public IReadOnlyList<string>? ReadablePaths { get; init; }
+
+    /// <summary>
+    /// Optional host directories or files granted temporary read/write access inside the sandbox (e.g., Windows AppContainer).
+    /// </summary>
+    public IReadOnlyList<string>? WritablePaths { get; init; }
 }
 
 /// <summary>

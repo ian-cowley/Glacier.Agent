@@ -278,16 +278,20 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
                 return _nodeChildIndices[nodeIdx][matchIndex];
             }
         }
+        else if (Vector128.IsHardwareAccelerated)
+        {
+            int idx = FindChildVector128(nodeIdx, b, simdCount);
+            if (idx >= 0)
+            {
+                return idx;
+            }
+        }
         else
         {
-            Vector256<byte> branchKeys = _nodeBranchVectors[nodeIdx];
-            int[] children = _nodeChildIndices[nodeIdx];
-            for (int i = 0; i < simdCount; i++)
+            int idx = FindChildScalar(nodeIdx, b, simdCount);
+            if (idx >= 0)
             {
-                if (branchKeys[i] == b)
-                {
-                    return children[i];
-                }
+                return idx;
             }
         }
 
@@ -302,6 +306,43 @@ public sealed class SimdRadixTrieTokenizer : ITokenizer
 
         return -1;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal int FindChildVector128(int nodeIdx, byte b, int simdCount)
+    {
+        Vector256<byte> branchKeys = _nodeBranchVectors[nodeIdx];
+        Vector128<byte> target = Vector128.Create(b);
+        uint loMask = Vector128.Equals(branchKeys.GetLower(), target).ExtractMostSignificantBits();
+        uint hiMask = simdCount > 16
+            ? Vector128.Equals(branchKeys.GetUpper(), target).ExtractMostSignificantBits()
+            : 0u;
+        uint mask = loMask | (hiMask << 16);
+        uint validMask = simdCount == 32 ? mask : (mask & ((1u << simdCount) - 1u));
+        if (validMask != 0)
+        {
+            int matchIndex = BitOperations.TrailingZeroCount(validMask);
+            return _nodeChildIndices[nodeIdx][matchIndex];
+        }
+        return -1;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal int FindChildScalar(int nodeIdx, byte b, int simdCount)
+    {
+        Vector256<byte> branchKeys = _nodeBranchVectors[nodeIdx];
+        int[] children = _nodeChildIndices[nodeIdx];
+        for (int i = 0; i < simdCount; i++)
+        {
+            if (branchKeys[i] == b)
+            {
+                return children[i];
+            }
+        }
+        return -1;
+    }
+
+    internal int GetRootNodeIndex(byte b) => _rootTable[b];
+    internal int GetNodeEdgeCount(int nodeIdx) => _nodeEdgeCounts[nodeIdx];
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void ThrowDestinationTooSmall()

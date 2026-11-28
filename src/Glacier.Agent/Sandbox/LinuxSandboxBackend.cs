@@ -65,6 +65,7 @@ internal static unsafe class LinuxSandboxBackend
                 outWriteFd: -1,
                 errOutWriteFd: -1,
                 hasMountNs: false,
+                strictNamespaceIsolation: false,
                 slashPtr: null,
                 procFsPtr: null,
                 procMountPtr: null,
@@ -140,13 +141,46 @@ internal static unsafe class LinuxSandboxBackend
         return null;
     }
 
+    private const int MaxCapturedOutputBytes = 4 * 1024 * 1024;
+
+    private static readonly string[] s_safeEnvironmentAllowlist =
+    [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TMPDIR",
+        "TZ",
+        "HOME",
+        "DOTNET_ROOT",
+        "LD_LIBRARY_PATH"
+    ];
+
     public static ValueTask<SandboxExecutionResult> ExecuteAsync(SandboxOptions options, CancellationToken ct)
     {
-        return new ValueTask<SandboxExecutionResult>(Task.Run(() => ExecuteCore(options, ct), CancellationToken.None));
+        return new ValueTask<SandboxExecutionResult>(ExecuteCoreAsync(options, ct));
     }
 
-    private static SandboxExecutionResult ExecuteCore(SandboxOptions options, CancellationToken ct)
+    private static async Task<SandboxExecutionResult> ExecuteCoreAsync(SandboxOptions options, CancellationToken ct)
     {
+        Task? pendingStdinTask = null;
+        try
+        {
+            return await Task.Run(() => ExecuteCore(options, ct, out pendingStdinTask), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (pendingStdinTask != null)
+            {
+                await pendingStdinTask.ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static SandboxExecutionResult ExecuteCore(SandboxOptions options, CancellationToken ct, out Task? pendingStdinTask)
+    {
+        pendingStdinTask = null;
         var totalSw = Stopwatch.StartNew();
         var startupSw = Stopwatch.StartNew();
 
@@ -365,6 +399,7 @@ internal static unsafe class LinuxSandboxBackend
                         outWriteFd: outWriteFd,
                         errOutWriteFd: errOutWriteFd,
                         hasMountNs: mountNsActive,
+                        strictNamespaceIsolation: options.EnableNamespaceIsolation && !LinuxSandboxPolicy.AllowUnisolatedNamespaceFallback(),
                         slashPtr: slashPtr,
                         procFsPtr: procFsPtr,
                         procMountPtr: procMountPtr,
@@ -466,6 +501,8 @@ internal static unsafe class LinuxSandboxBackend
             using var stderrStream = new MemoryStream();
             bool outOpen = true;
             bool errOpen = true;
+            bool outTruncated = false;
+            bool errTruncated = false;
             bool exited = false;
             bool timedOut = false;
             int waitStatus = 0;
@@ -551,12 +588,12 @@ internal static unsafe class LinuxSandboxBackend
 
                     if (outIdx >= 0 && pollFds[outIdx].Revents != 0)
                     {
-                        outOpen = DrainNonBlocking(outReadFd, stdoutStream, pScratch, readScratch.Length);
+                        outOpen = DrainNonBlocking(outReadFd, stdoutStream, pScratch, readScratch.Length, ref outTruncated);
                     }
 
                     if (errIdx >= 0 && pollFds[errIdx].Revents != 0)
                     {
-                        errOpen = DrainNonBlocking(errOutReadFd, stderrStream, pScratch, readScratch.Length);
+                        errOpen = DrainNonBlocking(errOutReadFd, stderrStream, pScratch, readScratch.Length, ref errTruncated);
                     }
 
                     if (pidIdx >= 0 && (pollFds[pidIdx].Revents & (LinuxNativeMethods.POLLIN | LinuxNativeMethods.POLLERR | LinuxNativeMethods.POLLHUP)) != 0)
@@ -587,18 +624,15 @@ internal static unsafe class LinuxSandboxBackend
 
                 if (outOpen)
                 {
-                    _ = DrainNonBlocking(outReadFd, stdoutStream, pScratch, readScratch.Length);
+                    _ = DrainNonBlocking(outReadFd, stdoutStream, pScratch, readScratch.Length, ref outTruncated);
                 }
                 if (errOpen)
                 {
-                    _ = DrainNonBlocking(errOutReadFd, stderrStream, pScratch, readScratch.Length);
+                    _ = DrainNonBlocking(errOutReadFd, stderrStream, pScratch, readScratch.Length, ref errTruncated);
                 }
             }
 
-            if (stdinTask != null)
-            {
-                stdinTask.GetAwaiter().GetResult();
-            }
+            pendingStdinTask = stdinTask;
 
             if (!timedOut && ct.IsCancellationRequested)
             {
@@ -607,11 +641,23 @@ internal static unsafe class LinuxSandboxBackend
 
             int exitCode = timedOut ? -1 : DecodeWaitStatus(waitStatus);
 
+            string stdOut = Encoding.UTF8.GetString(stdoutStream.GetBuffer(), 0, (int)stdoutStream.Length);
+            if (outTruncated)
+            {
+                stdOut += "\n[OUTPUT TRUNCATED]";
+            }
+
+            string stdErr = Encoding.UTF8.GetString(stderrStream.GetBuffer(), 0, (int)stderrStream.Length);
+            if (errTruncated)
+            {
+                stdErr += "\n[OUTPUT TRUNCATED]";
+            }
+
             return new SandboxExecutionResult
             {
                 ExitCode = exitCode,
-                StandardOutput = Encoding.UTF8.GetString(stdoutStream.GetBuffer(), 0, (int)stdoutStream.Length),
-                StandardError = Encoding.UTF8.GetString(stderrStream.GetBuffer(), 0, (int)stderrStream.Length),
+                StandardOutput = stdOut,
+                StandardError = stdErr,
                 StartupLatency = startupLatency,
                 TotalDuration = totalSw.Elapsed,
                 TimedOut = timedOut,
@@ -627,6 +673,11 @@ internal static unsafe class LinuxSandboxBackend
             {
                 KillProcessGroup(childPid, pidfd);
                 ReapChild(childPid, out _);
+            }
+
+            if (s_nativeSpawn != null && childPid > 0 && (options.MemoryLimitBytes.HasValue || options.MaxProcesses.HasValue))
+            {
+                CleanupCgroupLeafDirectory(childPid);
             }
 
             CloseAndReset(ref syncReadFd);
@@ -1130,6 +1181,7 @@ internal static unsafe class LinuxSandboxBackend
                 outWriteFd: outWriteFd,
                 errOutWriteFd: errOutWriteFd,
                 hasMountNs: false,
+                strictNamespaceIsolation: options.EnableNamespaceIsolation && !LinuxSandboxPolicy.AllowUnisolatedNamespaceFallback(),
                 slashPtr: slashPtr,
                 procFsPtr: procFsPtr,
                 procMountPtr: procMountPtr,
@@ -1213,6 +1265,7 @@ internal static unsafe class LinuxSandboxBackend
         int outWriteFd,
         int errOutWriteFd,
         bool hasMountNs,
+        bool strictNamespaceIsolation,
         byte* slashPtr,
         byte* procFsPtr,
         byte* procMountPtr,
@@ -1284,13 +1337,21 @@ internal static unsafe class LinuxSandboxBackend
 
         if (hasMountNs)
         {
-            _ = LinuxNativeMethods.ChildMount(null, slashPtr, null, LinuxNativeMethods.MS_REC | LinuxNativeMethods.MS_PRIVATE, null);
-            _ = LinuxNativeMethods.ChildMount(
-                procFsPtr,
-                procMountPtr,
-                procFsPtr,
-                LinuxNativeMethods.MS_NOSUID | LinuxNativeMethods.MS_NOEXEC | LinuxNativeMethods.MS_NODEV,
-                null);
+            if (LinuxNativeMethods.ChildMount(null, slashPtr, null, LinuxNativeMethods.MS_REC | LinuxNativeMethods.MS_PRIVATE, null) != 0 &&
+                strictNamespaceIsolation)
+            {
+                WriteChildErrnoAndExit(errWriteFd);
+            }
+            if (LinuxNativeMethods.ChildMount(
+                    procFsPtr,
+                    procMountPtr,
+                    procFsPtr,
+                    LinuxNativeMethods.MS_NOSUID | LinuxNativeMethods.MS_NOEXEC | LinuxNativeMethods.MS_NODEV,
+                    null) != 0 &&
+                strictNamespaceIsolation)
+            {
+                WriteChildErrnoAndExit(errWriteFd);
+            }
         }
 
         if (inReadFd >= 0 && inReadFd != 0)
@@ -1491,12 +1552,18 @@ internal static unsafe class LinuxSandboxBackend
     private static byte** BuildEnvp(UnmanagedPool pool, IReadOnlyDictionary<string, string>? overrides)
     {
         var merged = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        foreach (string key in s_safeEnvironmentAllowlist)
         {
-            if (entry.Key is string k && entry.Value is string v)
+            string? val = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrEmpty(val))
             {
-                merged[k] = v;
+                merged[key] = val;
             }
+        }
+
+        if (!merged.ContainsKey("PATH"))
+        {
+            merged["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
         }
 
         if (overrides != null)
@@ -1594,14 +1661,30 @@ internal static unsafe class LinuxSandboxBackend
         }
     }
 
-    private static bool DrainNonBlocking(int fd, MemoryStream dest, byte* scratch, int scratchLen)
+    private static bool DrainNonBlocking(int fd, MemoryStream dest, byte* scratch, int scratchLen, ref bool truncated)
     {
         while (true)
         {
             nint r = LinuxNativeMethods.Read(fd, scratch, (nuint)scratchLen);
             if (r > 0)
             {
-                dest.Write(new ReadOnlySpan<byte>(scratch, (int)r));
+                if (!truncated)
+                {
+                    int remaining = MaxCapturedOutputBytes - (int)dest.Length;
+                    if (remaining <= 0)
+                    {
+                        truncated = true;
+                    }
+                    else if (r <= remaining)
+                    {
+                        dest.Write(new ReadOnlySpan<byte>(scratch, (int)r));
+                    }
+                    else
+                    {
+                        dest.Write(new ReadOnlySpan<byte>(scratch, remaining));
+                        truncated = true;
+                    }
+                }
                 continue;
             }
             if (r == 0)
@@ -1647,6 +1730,42 @@ internal static unsafe class LinuxSandboxBackend
             break;
         }
         status = localStatus;
+    }
+
+    private static void CleanupCgroupLeafDirectory(int childPid)
+    {
+        try
+        {
+            if (!File.Exists("/proc/self/cgroup"))
+            {
+                return;
+            }
+
+            foreach (string line in File.ReadLines("/proc/self/cgroup"))
+            {
+                if (!line.StartsWith("0::", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                ReadOnlySpan<char> rel = line.AsSpan(3).Trim();
+                string baseCg = rel.IsEmpty || rel.SequenceEqual("/")
+                    ? "/sys/fs/cgroup"
+                    : Path.Combine("/sys/fs/cgroup", rel.TrimStart('/').ToString());
+                string cgDir = Path.Combine(baseCg, $"glacier_sbx_{childPid}");
+                if (Directory.Exists(cgDir))
+                {
+                    Directory.Delete(cgDir, recursive: false);
+                }
+                break;
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static int DecodeWaitStatus(int status)

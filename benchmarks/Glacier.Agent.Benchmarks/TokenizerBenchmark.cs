@@ -32,7 +32,7 @@ public class TokenizerBenchmark
         _outputBytes = new byte[1024];
 
         // Pre-encode for decode benchmark
-        int count = _tokenizer.Encode(_inputBytes, _outputTokens);
+        _ = _tokenizer.Encode(_inputBytes, _outputTokens);
     }
 
     [Benchmark(Baseline = true)]

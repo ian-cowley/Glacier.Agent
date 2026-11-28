@@ -183,7 +183,25 @@ public class AgentActor : IAgentActor
 
     public void Dispose()
     {
-        StopAsync().GetAwaiter().GetResult();
+        if (Interlocked.Exchange(ref _state, (int)ActorLifecycleState.Stopped) == (int)ActorLifecycleState.Stopped && _cts.IsCancellationRequested)
+        {
+            return;
+        }
+
+        _mailbox.Writer.TryComplete();
+        _cts.Cancel();
+
+        if (_processingLoopTask != null)
+        {
+            try
+            {
+                _processingLoopTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (AggregateException)
+            {
+            }
+        }
+
         _cts.Dispose();
         GC.SuppressFinalize(this);
     }

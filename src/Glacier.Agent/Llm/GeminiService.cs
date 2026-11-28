@@ -1,18 +1,78 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Agent.Serialization;
 
 namespace Glacier.Agent.Llm;
 
-public class GeminiService : ILlmService
+public sealed class GeminiGenerateResponse
+{
+    [JsonPropertyName("candidates")]
+    public List<GeminiCandidate>? Candidates { get; set; }
+
+    [JsonPropertyName("usageMetadata")]
+    public GeminiUsageMetadata? UsageMetadata { get; set; }
+}
+
+public sealed class GeminiCandidate
+{
+    [JsonPropertyName("content")]
+    public GeminiContentDto? Content { get; set; }
+}
+
+public sealed class GeminiContentDto
+{
+    [JsonPropertyName("role")]
+    public string? Role { get; set; }
+
+    [JsonPropertyName("parts")]
+    public List<GeminiPartDto>? Parts { get; set; }
+}
+
+public sealed class GeminiPartDto
+{
+    [JsonPropertyName("text")]
+    public string? Text { get; set; }
+
+    [JsonPropertyName("functionCall")]
+    public GeminiFunctionCallDto? FunctionCall { get; set; }
+}
+
+public sealed class GeminiFunctionCallDto
+{
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("args")]
+    public JsonElement? Args { get; set; }
+}
+
+public sealed class GeminiUsageMetadata
+{
+    [JsonPropertyName("promptTokenCount")]
+    public int PromptTokenCount { get; set; }
+
+    [JsonPropertyName("candidatesTokenCount")]
+    public int CandidatesTokenCount { get; set; }
+}
+
+public class GeminiService : ILlmService, IDisposable
 {
     private readonly HttpClient _httpClient;
+    private readonly bool _ownsHttpClient;
     private readonly string _apiKey;
     private readonly string _baseUrl;
+    private int _disposed;
 
     public GeminiService(
         string apiKey,
@@ -24,41 +84,57 @@ public class GeminiService : ILlmService
 
         _apiKey = apiKey;
         _baseUrl = baseUrl.TrimEnd('/');
+        _ownsHttpClient = httpClient is null;
         _httpClient = httpClient ?? new HttpClient();
     }
 
-    public async Task<LlmResponse> GenerateContentAsync(LlmRequest request)
+    public Task<LlmResponse> GenerateContentAsync(LlmRequest request)
     {
+        return GenerateContentAsync(request, CancellationToken.None);
+    }
+
+    public async Task<LlmResponse> GenerateContentAsync(LlmRequest request, CancellationToken ct)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(request);
 
         var modelPath = NormalizeModelPath(request.Model);
         var url = $"{_baseUrl}/{modelPath}:generateContent";
-        return await SendRequestAsync(url, request).ConfigureAwait(false);
+        return await SendRequestAsync(url, request, ct).ConfigureAwait(false);
     }
 
-    public async IAsyncEnumerable<LlmResponse> StreamGenerateContentAsync(LlmRequest request)
+    public IAsyncEnumerable<LlmResponse> StreamGenerateContentAsync(LlmRequest request)
     {
+        return StreamGenerateContentAsync(request, CancellationToken.None);
+    }
+
+    public async IAsyncEnumerable<LlmResponse> StreamGenerateContentAsync(
+        LlmRequest request,
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         ArgumentNullException.ThrowIfNull(request);
 
         var modelPath = NormalizeModelPath(request.Model);
         var url = $"{_baseUrl}/{modelPath}:streamGenerateContent?alt=sse";
 
-        var payload = CreatePayload(request);
-        using var requestMessage = CreateHttpRequest(url, payload.ToJsonString());
-        using var response = await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+        using var buffer = new PooledByteBufferWriter(1024);
+        WritePayload(buffer, request);
+        using var requestMessage = CreateHttpRequest(url, buffer.WrittenMemory);
+        using var response = await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
         {
-            var errorBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var errorBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             throw new HttpRequestException($"Gemini API Error (StreamGenerateContent): {response.StatusCode} at {url}\nDetails: {errorBody}");
         }
 
-        using var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+        using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var reader = new StreamReader(stream, Encoding.UTF8);
 
         StringBuilder? nonSseBuffer = null;
 
-        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+        while (await reader.ReadLineAsync(ct).ConfigureAwait(false) is { } line)
         {
             var trimmed = line.Trim();
             if (trimmed.Length == 0)
@@ -68,16 +144,16 @@ public class GeminiService : ILlmService
 
             if (nonSseBuffer is null && trimmed.StartsWith("data:", StringComparison.Ordinal))
             {
-                var data = trimmed.Substring(5).Trim();
-                if (data.Length == 0 || data == "[DONE]")
+                var data = trimmed.AsSpan(5).Trim();
+                if (data.Length == 0 || data.SequenceEqual("[DONE]"))
                 {
                     continue;
                 }
 
-                var node = JsonNode.Parse(data);
-                if (node is not null)
+                GeminiGenerateResponse? parsed = JsonSerializer.Deserialize(data, AdkJsonContext.Default.GeminiGenerateResponse);
+                if (parsed is not null)
                 {
-                    yield return ParseResponse(node);
+                    yield return MapResponse(parsed);
                 }
             }
             else if (nonSseBuffer is not null || trimmed.StartsWith('[') || trimmed.StartsWith('{'))
@@ -90,20 +166,25 @@ public class GeminiService : ILlmService
 
         if (nonSseBuffer is not null && nonSseBuffer.Length > 0)
         {
-            var doc = JsonNode.Parse(nonSseBuffer.ToString());
-            if (doc is JsonArray array)
+            string rawJson = nonSseBuffer.ToString().TrimStart();
+            if (rawJson.StartsWith('['))
             {
-                foreach (var item in array)
+                List<GeminiGenerateResponse>? array = JsonSerializer.Deserialize(rawJson, AdkJsonContext.Default.ListGeminiGenerateResponse);
+                if (array is not null)
                 {
-                    if (item is not null)
+                    foreach (GeminiGenerateResponse item in array)
                     {
-                        yield return ParseResponse(item);
+                        yield return MapResponse(item);
                     }
                 }
             }
-            else if (doc is not null)
+            else
             {
-                yield return ParseResponse(doc);
+                GeminiGenerateResponse? single = JsonSerializer.Deserialize(rawJson, AdkJsonContext.Default.GeminiGenerateResponse);
+                if (single is not null)
+                {
+                    yield return MapResponse(single);
+                }
             }
         }
     }
@@ -113,161 +194,201 @@ public class GeminiService : ILlmService
         return model.StartsWith("models/", StringComparison.Ordinal) ? model : $"models/{model}";
     }
 
-    private HttpRequestMessage CreateHttpRequest(string url, string jsonPayload)
+    private HttpRequestMessage CreateHttpRequest(string url, ReadOnlyMemory<byte> utf8Payload)
     {
+        var content = new ReadOnlyMemoryContent(utf8Payload);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
         var req = new HttpRequestMessage(HttpMethod.Post, url)
         {
-            Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json")
+            Content = content
         };
         req.Headers.TryAddWithoutValidation("x-goog-api-key", _apiKey);
         return req;
     }
 
-    private static JsonObject CreatePayload(LlmRequest request)
+    private static void WritePayload(IBufferWriter<byte> buffer, LlmRequest request)
     {
-        var payload = new JsonObject();
+        using var writer = new Utf8JsonWriter(buffer);
+        writer.WriteStartObject();
 
-        if (request.SystemInstruction is not null && request.SystemInstruction.Parts.Count > 0)
+        if (request.SystemInstruction is not null && HasWritableParts(request.SystemInstruction.Parts))
         {
-            var sysParts = MapParts(request.SystemInstruction.Parts);
-            if (sysParts.Count > 0)
-            {
-                payload["system_instruction"] = new JsonObject
-                {
-                    ["parts"] = sysParts
-                };
-            }
+            writer.WriteStartObject("system_instruction");
+            writer.WriteStartArray("parts");
+            WriteParts(writer, request.SystemInstruction.Parts);
+            writer.WriteEndArray();
+            writer.WriteEndObject();
         }
 
-        var contentsArray = new JsonArray();
+        writer.WriteStartArray("contents");
         foreach (var content in request.Contents)
         {
-            var partsArray = MapParts(content.Parts);
-            if (partsArray.Count == 0)
+            if (!HasWritableParts(content.Parts))
             {
                 continue;
             }
 
-            contentsArray.Add((JsonNode)new JsonObject
-            {
-                ["role"] = content.Role ?? "user",
-                ["parts"] = partsArray
-            });
+            writer.WriteStartObject();
+            writer.WriteString("role", content.Role ?? "user");
+            writer.WriteStartArray("parts");
+            WriteParts(writer, content.Parts);
+            writer.WriteEndArray();
+            writer.WriteEndObject();
         }
-        payload["contents"] = contentsArray;
+        writer.WriteEndArray();
 
         if (request.Tools.Count > 0)
         {
-            var declarations = new JsonArray();
+            writer.WriteStartArray("tools");
+            writer.WriteStartObject();
+            writer.WriteStartArray("function_declarations");
             foreach (var tool in request.Tools)
             {
-                declarations.Add((JsonNode)new JsonObject
+                writer.WriteStartObject();
+                writer.WriteString("name", tool.Name);
+                writer.WriteString("description", tool.Description);
+                writer.WritePropertyName("parameters");
+                JsonNode? schema = tool.GetParametersSchema();
+                if (schema is not null)
                 {
-                    ["name"] = tool.Name,
-                    ["description"] = tool.Description,
-                    ["parameters"] = tool.GetParametersSchema().DeepClone()
-                });
+                    schema.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartObject();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndObject();
             }
-
-            var toolsWrapper = new JsonArray();
-            toolsWrapper.Add((JsonNode)new JsonObject
-            {
-                ["function_declarations"] = declarations
-            });
-            payload["tools"] = toolsWrapper;
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.WriteEndArray();
         }
 
-        return payload;
+        writer.WriteEndObject();
+        writer.Flush();
     }
 
-    private static JsonArray MapParts(List<LlmPart> parts)
+    private static bool HasWritableParts(List<LlmPart> parts)
     {
-        var array = new JsonArray();
-        foreach (var part in parts)
+        for (int i = 0; i < parts.Count; i++)
         {
-            var partObj = new JsonObject();
-            bool hasField = false;
+            LlmPart p = parts[i];
+            if (p.Text is not null || p.FunctionCall is not null || p.FunctionResponse is not null)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
+    private static void WriteParts(Utf8JsonWriter writer, List<LlmPart> parts)
+    {
+        for (int i = 0; i < parts.Count; i++)
+        {
+            LlmPart part = parts[i];
+            if (part.Text is null && part.FunctionCall is null && part.FunctionResponse is null)
+            {
+                continue;
+            }
+
+            writer.WriteStartObject();
             if (part.Text is not null)
             {
-                partObj["text"] = part.Text;
-                hasField = true;
+                writer.WriteString("text", part.Text);
             }
 
             if (part.FunctionCall is not null)
             {
-                partObj["functionCall"] = new JsonObject
+                writer.WriteStartObject("functionCall");
+                writer.WriteString("name", part.FunctionCall.Name);
+                writer.WritePropertyName("args");
+                if (part.FunctionCall.Args is not null)
                 {
-                    ["name"] = part.FunctionCall.Name,
-                    ["args"] = part.FunctionCall.Args?.DeepClone() ?? new JsonObject()
-                };
-                hasField = true;
+                    part.FunctionCall.Args.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartObject();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndObject();
             }
 
             if (part.FunctionResponse is not null)
             {
-                partObj["functionResponse"] = new JsonObject
+                writer.WriteStartObject("functionResponse");
+                writer.WriteString("name", part.FunctionResponse.Name);
+                writer.WritePropertyName("response");
+                if (part.FunctionResponse.Response is not null)
                 {
-                    ["name"] = part.FunctionResponse.Name,
-                    ["response"] = part.FunctionResponse.Response?.DeepClone() ?? new JsonObject()
-                };
-                hasField = true;
+                    part.FunctionResponse.Response.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartObject();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndObject();
             }
 
-            if (hasField)
-            {
-                array.Add((JsonNode)partObj);
-            }
+            writer.WriteEndObject();
         }
-
-        return array;
     }
 
-    private async Task<LlmResponse> SendRequestAsync(string url, LlmRequest request)
+    private async Task<LlmResponse> SendRequestAsync(string url, LlmRequest request, CancellationToken ct)
     {
-        var payload = CreatePayload(request);
-        using var requestMessage = CreateHttpRequest(url, payload.ToJsonString());
-        using var response = await _httpClient.SendAsync(requestMessage).ConfigureAwait(false);
+        using var buffer = new PooledByteBufferWriter(1024);
+        WritePayload(buffer, request);
+        using var requestMessage = CreateHttpRequest(url, buffer.WrittenMemory);
+        using var response = await _httpClient.SendAsync(requestMessage, ct).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
         {
-            var errorBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var errorBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             throw new HttpRequestException($"Gemini API Error (GenerateContent): {response.StatusCode} at {url}\nDetails: {errorBody}");
         }
 
-        var json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-        var doc = JsonNode.Parse(json);
-        return ParseResponse(doc);
+        using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        GeminiGenerateResponse? parsed = await JsonSerializer.DeserializeAsync(
+            stream,
+            AdkJsonContext.Default.GeminiGenerateResponse,
+            ct).ConfigureAwait(false);
+        return parsed is not null ? MapResponse(parsed) : new LlmResponse();
     }
 
-    private static LlmResponse ParseResponse(JsonNode? doc)
+    private static LlmResponse MapResponse(GeminiGenerateResponse doc)
     {
-        var candidate = doc?["candidates"]?[0];
-        var content = candidate?["content"];
-        var parts = content?["parts"]?.AsArray();
-
         var llmResponse = new LlmResponse();
+
+        GeminiCandidate? candidate = doc.Candidates is { Count: > 0 } ? doc.Candidates[0] : null;
+        List<GeminiPartDto>? parts = candidate?.Content?.Parts;
 
         if (parts != null)
         {
             StringBuilder? textBuilder = null;
-            foreach (var part in parts)
+            for (int i = 0; i < parts.Count; i++)
             {
-                var textNode = part?["text"];
-                if (textNode != null)
+                GeminiPartDto part = parts[i];
+                if (part.Text is not null)
                 {
                     textBuilder ??= new StringBuilder();
-                    textBuilder.Append(textNode.ToString());
+                    textBuilder.Append(part.Text);
                 }
 
-                var fnCall = part?["functionCall"];
-                if (fnCall != null)
+                if (part.FunctionCall is not null)
                 {
                     llmResponse.FunctionCalls ??= new List<LlmFunctionCall>();
+                    JsonNode? argsNode = null;
+                    if (part.FunctionCall.Args is { ValueKind: not JsonValueKind.Undefined and not JsonValueKind.Null } argsElem)
+                    {
+                        argsNode = JsonNode.Parse(argsElem.GetRawText());
+                    }
+
                     llmResponse.FunctionCalls.Add(new LlmFunctionCall
                     {
-                        Name = fnCall["name"]?.ToString() ?? string.Empty,
-                        Args = fnCall["args"]?.DeepClone()
+                        Name = part.FunctionCall.Name ?? string.Empty,
+                        Args = argsNode
                     });
                 }
             }
@@ -278,13 +399,12 @@ public class GeminiService : ILlmService
             }
         }
 
-        var usage = doc?["usageMetadata"];
-        if (usage != null)
+        if (doc.UsageMetadata is not null)
         {
             llmResponse.Usage = new LlmUsage
             {
-                PromptTokens = usage["promptTokenCount"]?.GetValue<int>() ?? 0,
-                CompletionTokens = usage["candidatesTokenCount"]?.GetValue<int>() ?? 0
+                PromptTokens = doc.UsageMetadata.PromptTokenCount,
+                CompletionTokens = doc.UsageMetadata.CandidatesTokenCount
             };
 
             if (llmResponse.Usage.TotalTokens > 0)
@@ -294,5 +414,19 @@ public class GeminiService : ILlmService
         }
 
         return llmResponse;
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposing && Interlocked.Exchange(ref _disposed, 1) == 0 && _ownsHttpClient)
+        {
+            _httpClient.Dispose();
+        }
     }
 }

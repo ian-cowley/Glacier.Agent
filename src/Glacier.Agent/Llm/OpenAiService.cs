@@ -850,7 +850,7 @@ public class OpenAiService : ILlmService, IDisposable
 
             return JsonNode.Parse(input);
         }
-        catch
+        catch (JsonException)
         {
             return null;
         }

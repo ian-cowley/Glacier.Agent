@@ -1,6 +1,7 @@
 namespace Glacier.Agent.Mcp;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -33,14 +34,48 @@ public sealed class StreamMcpTransport : IMcpTransport
 
     public async ValueTask SendMessageAsync(string messageJson, CancellationToken ct = default)
     {
-        if (_isDisposed) throw new ObjectDisposedException(nameof(StreamMcpTransport));
+        ArgumentNullException.ThrowIfNull(messageJson);
+        ObjectDisposedException.ThrowIf(_isDisposed, this);
 
-        byte[] bytes = Encoding.UTF8.GetBytes(messageJson + "\n");
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(messageJson.Length) + 1;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(maxBytes);
+        try
+        {
+            int written = Encoding.UTF8.GetBytes(messageJson.AsSpan(), rented);
+            rented[written++] = (byte)'\n';
+            await WriteFrameLockedAsync(rented.AsMemory(0, written), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    public async ValueTask SendMessageUtf8Async(ReadOnlyMemory<byte> utf8Json, CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_isDisposed, this);
+
+        int frameLen = utf8Json.Length + 1;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(frameLen);
+        try
+        {
+            utf8Json.Span.CopyTo(rented);
+            rented[utf8Json.Length] = (byte)'\n';
+            await WriteFrameLockedAsync(rented.AsMemory(0, frameLen), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private async ValueTask WriteFrameLockedAsync(ReadOnlyMemory<byte> frame, CancellationToken ct)
+    {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_isDisposed) throw new ObjectDisposedException(nameof(StreamMcpTransport));
-            await _outputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
+            await _outputStream.WriteAsync(frame, ct).ConfigureAwait(false);
             await _outputStream.FlushAsync(ct).ConfigureAwait(false);
         }
         finally
@@ -91,7 +126,21 @@ public sealed class StreamMcpTransport : IMcpTransport
 
     public void Dispose()
     {
-        CloseAsync().GetAwaiter().GetResult();
-        _writeLock.Dispose();
+        if (_isDisposed) return;
+        _isDisposed = true;
+        bool acquired = false;
+        try
+        {
+            acquired = _writeLock.Wait(TimeSpan.FromSeconds(2));
+            _reader.Dispose();
+        }
+        finally
+        {
+            if (acquired)
+            {
+                _writeLock.Release();
+            }
+            _writeLock.Dispose();
+        }
     }
 }

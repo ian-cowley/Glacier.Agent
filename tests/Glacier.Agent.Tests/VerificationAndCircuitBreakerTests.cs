@@ -906,4 +906,15 @@ public sealed class VerificationAndCircuitBreakerTests
         Assert.True(ex.LastResult.CircuitTripped);
         Assert.Equal(VerificationStatus.CircuitBreakerTripped, ex.LastResult.Status);
     }
+
+    [Fact]
+    public void Telemetry_UsesGlacierAgentNaming()
+    {
+        Assert.Equal("Glacier.Agent", Telemetry.ActivitySource.Name);
+        Assert.Equal("Glacier.Agent", Telemetry.Meter.Name);
+        Assert.StartsWith("Glacier.Agent_", Telemetry.TokenCounter.Name, StringComparison.Ordinal);
+        Assert.StartsWith("Glacier.Agent_", Telemetry.AgentRunsCounter.Name, StringComparison.Ordinal);
+        Assert.StartsWith("Glacier.Agent_", Telemetry.ToolExecutionCounter.Name, StringComparison.Ordinal);
+        Assert.StartsWith("Glacier.Agent_", Telemetry.VerificationAttemptsCounter.Name, StringComparison.Ordinal);
+    }
 }

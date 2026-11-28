@@ -4,10 +4,10 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Agent.Serialization;
 
 /// <summary>
 /// Native pure C# Model Context Protocol (MCP) client.
@@ -20,6 +20,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _pendingRequests = new();
     private long _nextId;
     private Task? _listenerTask;
+    private int _disposed;
 
     public McpClient(IMcpTransport transport)
     {
@@ -81,14 +82,12 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
     private async ValueTask<JsonElement> SendRequestAsync(string method, Action<Utf8JsonWriter>? writeParams, CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         Start();
 
         long id = Interlocked.Increment(ref _nextId);
-        var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingRequests[id] = tcs;
-
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using var buffer = new PooledByteBufferWriter(256);
+        using (var writer = new Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
             writer.WriteString("jsonrpc", "2.0");
@@ -100,12 +99,23 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
                 writeParams(writer);
             }
             writer.WriteEndObject();
+            writer.Flush();
         }
 
-        string requestJson = Encoding.UTF8.GetString(stream.ToArray());
-        await _transport.SendMessageAsync(requestJson, ct).ConfigureAwait(false);
+        var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingRequests[id] = tcs;
 
-        using (ct.Register(() => tcs.TrySetCanceled()))
+        try
+        {
+            await _transport.SendMessageUtf8Async(buffer.WrittenMemory, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            _pendingRequests.TryRemove(id, out _);
+            throw;
+        }
+
+        using (ct.Register(static state => ((TaskCompletionSource<JsonElement>)state!).TrySetCanceled(), tcs))
         {
             return await tcs.Task.ConfigureAwait(false);
         }
@@ -113,10 +123,11 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
     private async ValueTask SendNotificationAsync(string method, Action<Utf8JsonWriter>? writeParams, CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         Start();
 
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using var buffer = new PooledByteBufferWriter(256);
+        using (var writer = new Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
             writer.WriteString("jsonrpc", "2.0");
@@ -127,10 +138,10 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
                 writeParams(writer);
             }
             writer.WriteEndObject();
+            writer.Flush();
         }
 
-        string json = Encoding.UTF8.GetString(stream.ToArray());
-        await _transport.SendMessageAsync(json, ct).ConfigureAwait(false);
+        await _transport.SendMessageUtf8Async(buffer.WrittenMemory, ct).ConfigureAwait(false);
     }
 
     public async ValueTask<McpInitializeResult> InitializeAsync(
@@ -153,7 +164,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
         await SendNotificationAsync("notifications/initialized", null, ct).ConfigureAwait(false);
 
-        return JsonSerializer.Deserialize(result.GetRawText(), AgentMcpJsonContext.Default.McpInitializeResult)!;
+        return JsonSerializer.Deserialize(result, AgentMcpJsonContext.Default.McpInitializeResult)!;
     }
 
     public async ValueTask<bool> PingAsync(CancellationToken ct = default)
@@ -163,7 +174,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
             await SendRequestAsync("ping", null, ct).ConfigureAwait(false);
             return true;
         }
-        catch
+        catch (Exception)
         {
             return false;
         }
@@ -186,17 +197,21 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
     public async ValueTask<McpToolCallResult> CallToolAsync(string name, string argumentsJson, CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        using JsonDocument? parsedArgs = string.IsNullOrWhiteSpace(argumentsJson)
+            ? null
+            : ParseValidatedJson(argumentsJson, nameof(argumentsJson));
+
         JsonElement result = await SendRequestAsync("tools/call", writer =>
         {
             writer.WriteStartObject();
             writer.WriteString("name", name);
             writer.WritePropertyName("arguments");
-            try
+            if (parsedArgs is not null)
             {
-                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(argumentsJson) ? "{}" : argumentsJson);
-                doc.RootElement.WriteTo(writer);
+                parsedArgs.RootElement.WriteTo(writer);
             }
-            catch
+            else
             {
                 writer.WriteStartObject();
                 writer.WriteEndObject();
@@ -204,7 +219,19 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
             writer.WriteEndObject();
         }, ct).ConfigureAwait(false);
 
-        return JsonSerializer.Deserialize(result.GetRawText(), AgentMcpJsonContext.Default.McpToolCallResult)!;
+        return JsonSerializer.Deserialize(result, AgentMcpJsonContext.Default.McpToolCallResult)!;
+    }
+
+    private static JsonDocument ParseValidatedJson(string json, string paramName)
+    {
+        try
+        {
+            return JsonDocument.Parse(json);
+        }
+        catch (JsonException ex)
+        {
+            throw new ArgumentException($"Invalid JSON payload: {ex.Message}", paramName, ex);
+        }
     }
 
     public async ValueTask<IReadOnlyList<McpResource>> ListResourcesAsync(CancellationToken ct = default)
@@ -212,7 +239,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
         JsonElement result = await SendRequestAsync("resources/list", static w => { w.WriteStartObject(); w.WriteEndObject(); }, ct).ConfigureAwait(false);
         if (result.TryGetProperty("resources", out JsonElement resElem))
         {
-            return JsonSerializer.Deserialize(resElem.GetRawText(), AgentMcpJsonContext.Default.ListMcpResource) ?? new List<McpResource>();
+            return JsonSerializer.Deserialize(resElem, AgentMcpJsonContext.Default.ListMcpResource) ?? new List<McpResource>();
         }
         return Array.Empty<McpResource>();
     }
@@ -228,7 +255,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
         if (result.TryGetProperty("contents", out JsonElement contentsElem) && contentsElem.GetArrayLength() > 0)
         {
-            return JsonSerializer.Deserialize(contentsElem[0].GetRawText(), AgentMcpJsonContext.Default.McpResourceContent)!;
+            return JsonSerializer.Deserialize(contentsElem[0], AgentMcpJsonContext.Default.McpResourceContent)!;
         }
         throw new InvalidOperationException($"No content returned for resource '{uri}'.");
     }
@@ -238,7 +265,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
         JsonElement result = await SendRequestAsync("prompts/list", static w => { w.WriteStartObject(); w.WriteEndObject(); }, ct).ConfigureAwait(false);
         if (result.TryGetProperty("prompts", out JsonElement promptsElem))
         {
-            return JsonSerializer.Deserialize(promptsElem.GetRawText(), AgentMcpJsonContext.Default.ListMcpPrompt) ?? new List<McpPrompt>();
+            return JsonSerializer.Deserialize(promptsElem, AgentMcpJsonContext.Default.ListMcpPrompt) ?? new List<McpPrompt>();
         }
         return Array.Empty<McpPrompt>();
     }
@@ -259,7 +286,7 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
         if (result.TryGetProperty("messages", out JsonElement msgElem))
         {
-            return JsonSerializer.Deserialize(msgElem.GetRawText(), AgentMcpJsonContext.Default.ListMcpPromptMessage) ?? new List<McpPromptMessage>();
+            return JsonSerializer.Deserialize(msgElem, AgentMcpJsonContext.Default.ListMcpPromptMessage) ?? new List<McpPromptMessage>();
         }
         return Array.Empty<McpPromptMessage>();
     }
@@ -274,17 +301,51 @@ public sealed class McpClient : IAsyncDisposable, IDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         _cts.Cancel();
         await _transport.CloseAsync().ConfigureAwait(false);
         if (_listenerTask != null)
         {
-            try { await _listenerTask.ConfigureAwait(false); } catch { }
+            try
+            {
+                await _listenerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
         _cts.Dispose();
     }
 
     public void Dispose()
     {
-        DisposeAsync().GetAwaiter().GetResult();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _cts.Cancel();
+        _transport.Dispose();
+        if (_listenerTask != null)
+        {
+            try
+            {
+                _listenerTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (AggregateException)
+            {
+            }
+        }
+        _cts.Dispose();
     }
 }

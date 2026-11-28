@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Glacier.Agent.Workflows;
@@ -145,9 +148,19 @@ public class LlmAgent : IAgent
         return "No response generated.";
     }
 
-    public async IAsyncEnumerable<string> RunStreamingAsync(string prompt, ILlmService llmService, string? sessionId = null)
+    public IAsyncEnumerable<string> RunStreamingAsync(string prompt, ILlmService llmService, string? sessionId = null)
+    {
+        return RunStreamingAsync(prompt, llmService, sessionId, CancellationToken.None);
+    }
+
+    public async IAsyncEnumerable<string> RunStreamingAsync(
+        string prompt,
+        ILlmService llmService,
+        string? sessionId,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(llmService);
+        cancellationToken.ThrowIfCancellationRequested();
 
         using var activity = Telemetry.ActivitySource.StartActivity($"Stream {Name}");
         activity?.SetTag("agent.name", Name);
@@ -165,16 +178,27 @@ public class LlmAgent : IAgent
         LastVerificationResult = null;
         await SaveMessageAsync(sessionId, userMessage).ConfigureAwait(false);
 
+        int turnCount = 0;
+        var recentToolCalls = new List<string>();
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            turnCount++;
+            if (MaxTurns > 0 && turnCount > MaxTurns)
+            {
+                yield return $"Stage '{Name}' reached MaxTurns={MaxTurns}. Handing off current progress to next stage.";
+                yield break;
+            }
+
             var request = CreateRequest();
             await OnBeforeModelInvokeAsync(request).ConfigureAwait(false);
 
             var fullContentBuilder = new StringBuilder();
             List<LlmFunctionCall>? toolCalls = null;
 
-            await foreach (var chunk in llmService.StreamGenerateContentAsync(request).ConfigureAwait(false))
+            await foreach (var chunk in llmService.StreamGenerateContentAsync(request).WithCancellation(cancellationToken).ConfigureAwait(false))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!string.IsNullOrEmpty(chunk.Content))
                 {
                     fullContentBuilder.Append(chunk.Content);
@@ -202,6 +226,22 @@ public class LlmAgent : IAgent
                     History.Add(feedback);
                     await SaveMessageAsync(sessionId, feedback).ConfigureAwait(false);
                     continue;
+                }
+
+                if (MaxIdenticalToolCalls > 0)
+                {
+                    string sig = string.Join("|", toolCalls.Select(c => $"{c.Name}:{c.Args?.ToJsonString() ?? "{}"}"));
+                    int identicalCount = recentToolCalls.TakeLast(4).Count(s => string.Equals(s, sig, StringComparison.Ordinal));
+                    recentToolCalls.Add(sig);
+                    if (identicalCount >= MaxIdenticalToolCalls)
+                    {
+                        var loopFeedback = LlmContent.User(
+                            $"System: LoopGuard blocked repeated identical tool call `{toolCalls[0].Name}`. " +
+                            "Do NOT repeat it. Switch strategy or conclude this stage with a plain-text summary.");
+                        History.Add(loopFeedback);
+                        await SaveMessageAsync(sessionId, loopFeedback).ConfigureAwait(false);
+                        continue;
+                    }
                 }
 
                 var (tripped, haltedOutput) = await HandleToolCallsAsync(toolCalls, sessionId, verificationBreaker).ConfigureAwait(false);
@@ -466,7 +506,7 @@ public class LlmAgent : IAgent
                     return parsed;
                 }
             }
-            catch
+            catch (JsonException)
             {
                 // Not valid JSON; wrap as string property below.
             }

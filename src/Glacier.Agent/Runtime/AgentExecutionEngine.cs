@@ -1041,7 +1041,7 @@ public sealed class AgentExecutionEngine : IAgentRuntime
             decision = new AgentStepDecision("Invoking tool " + name, false, name, argsJson);
             return true;
         }
-        catch
+        catch (JsonException)
         {
             return false;
         }

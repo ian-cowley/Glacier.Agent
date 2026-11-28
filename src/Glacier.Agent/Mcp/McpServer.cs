@@ -4,10 +4,11 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
+using Glacier.Agent.Serialization;
 
 /// <summary>
 /// Native pure C# Model Context Protocol (MCP) server.
@@ -15,12 +16,17 @@ using System.Threading.Tasks;
 /// </summary>
 public sealed class McpServer : IAsyncDisposable, IDisposable
 {
+    private const int MessageQueueCapacity = 256;
+
     private readonly IMcpTransport _transport;
     private readonly string _name;
     private readonly string _version;
     private readonly CancellationTokenSource _cts = new();
+    private readonly Channel<string> _messageChannel;
+    private readonly List<Task> _workerTasks = new();
     private Task? _listenerTask;
     private volatile bool _isInitialized;
+    private int _disposed;
 
     private readonly ConcurrentDictionary<string, (McpTool Tool, Func<string, CancellationToken, ValueTask<McpToolCallResult>> Handler)> _tools = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, (McpResource Resource, Func<string, CancellationToken, ValueTask<McpResourceContent>> Reader)> _resources = new(StringComparer.Ordinal);
@@ -35,6 +41,12 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         _name = name;
         _version = version;
+        _messageChannel = Channel.CreateBounded<string>(new BoundedChannelOptions(MessageQueueCapacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleWriter = true,
+            SingleReader = false
+        });
     }
 
     public void RegisterTool(McpTool tool, Func<string, CancellationToken, ValueTask<McpToolCallResult>> handler)
@@ -44,18 +56,27 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
 
     public void RegisterTool(IAgentTool agentTool)
     {
-        object schemaObj;
-        try
+        ArgumentNullException.ThrowIfNull(agentTool);
+
+        JsonElement schemaElem;
+        if (string.IsNullOrWhiteSpace(agentTool.ParameterJsonSchema))
         {
-            using var doc = JsonDocument.Parse(agentTool.ParameterJsonSchema);
-            schemaObj = doc.RootElement.Clone();
+            schemaElem = McpTool.DefaultInputSchemaElement;
         }
-        catch
+        else
         {
-            schemaObj = """{"type":"object"}""";
+            try
+            {
+                using var doc = JsonDocument.Parse(agentTool.ParameterJsonSchema);
+                schemaElem = doc.RootElement.Clone();
+            }
+            catch (JsonException ex)
+            {
+                throw new ArgumentException($"Invalid JSON schema for tool '{agentTool.Name}': {ex.Message}", nameof(agentTool), ex);
+            }
         }
 
-        var mcpTool = new McpTool(agentTool.Name, agentTool.Description, schemaObj);
+        var mcpTool = new McpTool(agentTool.Name, agentTool.Description, schemaElem);
         RegisterTool(mcpTool, async (args, ct) =>
         {
             try
@@ -63,7 +84,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
                 string result = await agentTool.ExecuteAsync(args, ct).ConfigureAwait(false);
                 return McpToolCallResult.Success(result);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 return McpToolCallResult.Error(ex.Message);
             }
@@ -84,6 +105,11 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
     {
         if (_listenerTask == null)
         {
+            int workerCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
+            for (int i = 0; i < workerCount; i++)
+            {
+                _workerTasks.Add(Task.Run(() => WorkerLoopAsync(_cts.Token)));
+            }
             _listenerTask = Task.Run(() => ListenLoopAsync(_cts.Token));
         }
     }
@@ -94,17 +120,33 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         {
             await foreach (string line in _transport.ReadMessagesAsync(ct).ConfigureAwait(false))
             {
-                _ = Task.Run(async () =>
+                await _messageChannel.Writer.WriteAsync(line, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown
+        }
+        finally
+        {
+            _messageChannel.Writer.TryComplete();
+        }
+    }
+
+    private async Task WorkerLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            await foreach (string line in _messageChannel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                try
                 {
-                    try
-                    {
-                        await ProcessMessageAsync(line, ct).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        Console.Error.WriteLine($"[McpServer] Error processing message: {ex.Message}");
-                    }
-                }, ct);
+                    await ProcessMessageAsync(line, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Console.Error.WriteLine($"[McpServer] Error processing message: {ex.Message}");
+                }
             }
         }
         catch (OperationCanceledException)
@@ -145,7 +187,7 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
         {
             await SendErrorResponseAsync(idElement, rpcEx.Code, rpcEx.Message, ct).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             await SendErrorResponseAsync(idElement, -32603, ex.Message, ct).ConfigureAwait(false);
         }
@@ -322,8 +364,8 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
 
     private async ValueTask SendSuccessResponseAsync(JsonElement id, Action<Utf8JsonWriter> writeResult, CancellationToken ct)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using var buffer = new PooledByteBufferWriter(256);
+        using (var writer = new Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
             writer.WriteString("jsonrpc", "2.0");
@@ -332,16 +374,16 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
             writer.WritePropertyName("result");
             writeResult(writer);
             writer.WriteEndObject();
+            writer.Flush();
         }
 
-        string responseJson = Encoding.UTF8.GetString(stream.ToArray());
-        await _transport.SendMessageAsync(responseJson, ct).ConfigureAwait(false);
+        await _transport.SendMessageUtf8Async(buffer.WrittenMemory, ct).ConfigureAwait(false);
     }
 
     private async ValueTask SendErrorResponseAsync(JsonElement id, int code, string message, CancellationToken ct)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using var buffer = new PooledByteBufferWriter(256);
+        using (var writer = new Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
             writer.WriteString("jsonrpc", "2.0");
@@ -352,26 +394,82 @@ public sealed class McpServer : IAsyncDisposable, IDisposable
             writer.WriteString("message", message);
             writer.WriteEndObject();
             writer.WriteEndObject();
+            writer.Flush();
         }
 
-        string responseJson = Encoding.UTF8.GetString(stream.ToArray());
-        await _transport.SendMessageAsync(responseJson, ct).ConfigureAwait(false);
+        await _transport.SendMessageUtf8Async(buffer.WrittenMemory, ct).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         _cts.Cancel();
+        _messageChannel.Writer.TryComplete();
         await _transport.CloseAsync().ConfigureAwait(false);
         if (_listenerTask != null)
         {
-            try { await _listenerTask.ConfigureAwait(false); } catch { }
+            try
+            {
+                await _listenerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (IOException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+        if (_workerTasks.Count > 0)
+        {
+            try
+            {
+                await Task.WhenAll(_workerTasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
         }
         _cts.Dispose();
     }
 
     public void Dispose()
     {
-        DisposeAsync().GetAwaiter().GetResult();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        _cts.Cancel();
+        _messageChannel.Writer.TryComplete();
+        _transport.Dispose();
+        if (_listenerTask != null)
+        {
+            try
+            {
+                _listenerTask.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (AggregateException)
+            {
+            }
+        }
+        if (_workerTasks.Count > 0)
+        {
+            try
+            {
+                Task.WhenAll(_workerTasks).Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (AggregateException)
+            {
+            }
+        }
+        _cts.Dispose();
     }
 }
 

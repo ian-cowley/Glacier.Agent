@@ -62,9 +62,9 @@ public sealed class SandboxVerificationTests
         var hook = new SandboxVerificationHook(_ => OperatingSystem.IsWindows()
             ? new SandboxOptions
             {
-                ExecutablePath = "cmd.exe",
-                Arguments = new[] { "/c", "ping -n 20 127.0.0.1 > nul" },
-                Timeout = TimeSpan.FromMilliseconds(150)
+                ExecutablePath = "powershell.exe",
+                Arguments = new[] { "-NoProfile", "-Command", "Start-Sleep -Seconds 20" },
+                Timeout = TimeSpan.FromMilliseconds(250)
             }
             : new SandboxOptions
             {

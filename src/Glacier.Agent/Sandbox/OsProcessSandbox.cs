@@ -10,8 +10,9 @@ using System.Threading;
 using System.Threading.Tasks;
 
 /// <summary>
-/// Cross-platform, Native-AOT compatible OS process sandbox using Win32 Job Objects + Restricted Tokens
-/// on Windows and <c>clone3</c>/<c>unshare</c> namespaces + <c>prctl</c>/<c>setrlimit</c> on Linux.
+/// Cross-platform, Native-AOT compatible OS process sandbox using Win32 Job Objects + AppContainer/LowIL
+/// (or Restricted Tokens when network is allowed) on Windows, and <c>clone3</c>/<c>unshare</c> namespaces
+/// + <c>pivot_root</c> + <c>seccomp-bpf</c> + <c>prctl</c>/<c>cgroups</c>/<c>setrlimit</c> on Linux.
 /// </summary>
 public sealed class OsProcessSandbox : ISandboxExecutor
 {
@@ -60,6 +61,30 @@ public sealed class OsProcessSandbox : ISandboxExecutor
         throw new PlatformNotSupportedException($"OS-isolated sandbox is not supported on {RuntimeInformation.OSDescription}.");
     }
 
+    private const int MaxCapturedOutputChars = 4 * 1024 * 1024;
+
+    private static readonly string[] s_fallbackEnvAllowlist =
+    [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "TZ",
+        "HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "DOTNET_ROOT",
+        "LD_LIBRARY_PATH"
+    ];
+
     private static async ValueTask<SandboxExecutionResult> ExecuteFallbackProcessAsync(SandboxOptions options, CancellationToken ct)
     {
         var totalSw = Stopwatch.StartNew();
@@ -81,11 +106,24 @@ public sealed class OsProcessSandbox : ISandboxExecutor
             psi.ArgumentList.Add(arg);
         }
 
+        psi.Environment.Clear();
+        foreach (string key in s_fallbackEnvAllowlist)
+        {
+            string? val = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrEmpty(val))
+            {
+                psi.Environment[key] = val;
+            }
+        }
+
         if (options.EnvironmentVariables != null)
         {
             foreach (KeyValuePair<string, string> kvp in options.EnvironmentVariables)
             {
-                psi.Environment[kvp.Key] = kvp.Value;
+                if (!string.IsNullOrEmpty(kvp.Key))
+                {
+                    psi.Environment[kvp.Key] = kvp.Value ?? string.Empty;
+                }
             }
         }
 
@@ -101,8 +139,8 @@ public sealed class OsProcessSandbox : ISandboxExecutor
         Task stdinTask = options.StandardInput != null
             ? WriteStandardInputAsync(process, options.StandardInput, ct)
             : Task.CompletedTask;
-        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+        Task<string> stdoutTask = ReadLimitedAsync(process.StandardOutput);
+        Task<string> stderrTask = ReadLimitedAsync(process.StandardError);
 
         using var timeoutCts = options.Timeout > TimeSpan.Zero
             ? CancellationTokenSource.CreateLinkedTokenSource(ct)
@@ -142,6 +180,37 @@ public sealed class OsProcessSandbox : ISandboxExecutor
             TimedOut = timedOut,
             IsolationMechanism = "ProcessFallback(no-namespace)"
         };
+    }
+
+    private static async Task<string> ReadLimitedAsync(StreamReader reader)
+    {
+        var sb = new StringBuilder();
+        char[] buf = new char[4096];
+        bool truncated = false;
+        int read;
+        while ((read = await reader.ReadAsync(buf.AsMemory()).ConfigureAwait(false)) > 0)
+        {
+            if (!truncated)
+            {
+                int remaining = MaxCapturedOutputChars - sb.Length;
+                if (remaining <= 0)
+                {
+                    sb.Append("\n[OUTPUT TRUNCATED]");
+                    truncated = true;
+                }
+                else if (read <= remaining)
+                {
+                    sb.Append(buf, 0, read);
+                }
+                else
+                {
+                    sb.Append(buf, 0, remaining);
+                    sb.Append("\n[OUTPUT TRUNCATED]");
+                    truncated = true;
+                }
+            }
+        }
+        return sb.ToString();
     }
 
     private static async Task WriteStandardInputAsync(Process process, string input, CancellationToken ct)

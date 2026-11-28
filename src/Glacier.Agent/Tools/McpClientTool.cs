@@ -39,7 +39,7 @@ public class McpClientTool : ITool
             {
                 return JsonNode.Parse(rawJson) ?? new JsonObject { ["type"] = "object", ["properties"] = new JsonObject() };
             }
-            catch
+            catch (JsonException)
             {
             }
         }
